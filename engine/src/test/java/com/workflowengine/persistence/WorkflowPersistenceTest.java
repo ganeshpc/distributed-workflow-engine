@@ -9,9 +9,12 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.containers.wait.strategy.Wait;
+import org.testcontainers.containers.wait.strategy.WaitAllStrategy;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.UUID;
 
@@ -32,7 +35,12 @@ class WorkflowPersistenceTest {
 
     @Container
     @ServiceConnection
-    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16");
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16")
+            .waitingFor(new WaitAllStrategy()
+                    .withStrategy(Wait.forLogMessage(
+                            ".*database system is ready to accept connections.*\\s", 2))
+                    .withStrategy(Wait.forListeningPort())
+                    .withStartupTimeout(Duration.ofSeconds(60)));
 
     @Autowired
     private WorkflowInstanceRepository instanceRepository;
@@ -49,6 +57,9 @@ class WorkflowPersistenceTest {
 
         String idempotencyKey = "order-" + UUID.randomUUID();
         WorkflowInstanceEntity saved = persistOrderInstance(idempotencyKey);
+
+        assertThat(saved.getCreatedAt()).isNotNull();
+        assertThat(saved.getUpdatedAt()).isNotNull();
 
         WorkflowInstanceEntity reloaded = instanceRepository.findById(saved.getId()).orElseThrow();
 
@@ -79,6 +90,19 @@ class WorkflowPersistenceTest {
         assertThat(ordered)
                 .extracting(WorkflowStepEntity::getName)
                 .containsExactlyElementsOf(ORDER_STEPS);
+    }
+
+    @Test
+    void flushPopulatesUpdatedAtWithoutReload() {
+        WorkflowInstanceEntity saved = persistOrderInstance("ts-" + UUID.randomUUID());
+        assertThat(saved.getCreatedAt()).isNotNull();
+        assertThat(saved.getUpdatedAt()).isNotNull();
+
+        saved.setStatus(WorkflowStatus.RUNNING);
+        WorkflowInstanceEntity afterUpdate = instanceRepository.saveAndFlush(saved);
+
+        assertThat(afterUpdate.getCreatedAt()).isEqualTo(saved.getCreatedAt());
+        assertThat(afterUpdate.getUpdatedAt()).isNotNull();
     }
 
     @Test

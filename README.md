@@ -37,3 +37,19 @@ curl -s http://localhost:8080/actuator/health
 ```
 
 Expect `{"status":"UP"}`.
+
+## Start an ORDER workflow
+
+```text
+docker compose up -d
+# wait for postgres healthy
+mvn -pl engine -am spring-boot:run
+
+curl -sD - -X POST http://localhost:8080/api/v1/workflows \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"ORDER","idempotencyKey":"order-1001","input":{"customerId":"cust-9","amountCents":4999}}'
+# 201 + Location: /api/v1/workflows/<id>
+
+curl -s http://localhost:8080/api/v1/workflows/<id>
+# poll until status=COMPLETED
+```

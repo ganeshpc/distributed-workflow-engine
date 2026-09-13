@@ -37,9 +37,16 @@ public final class ActivityBlockHook {
             return;
         }
         gate.entered.countDown();
-        try {
-            gate.release.await();
-        } catch (InterruptedException ex) {
+        boolean interrupted = false;
+        while (true) {
+            try {
+                gate.release.await();
+                break;
+            } catch (InterruptedException ex) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) {
             Thread.currentThread().interrupt();
         }
     }

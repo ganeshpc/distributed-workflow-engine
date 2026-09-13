@@ -19,7 +19,6 @@ import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
-import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 
@@ -123,12 +122,12 @@ public class WorkflowExecutor {
         int attempt = step.getAttempt() + 1;
         step.setStatus(StepStatus.RUNNING);
         step.setAttempt(attempt);
-        step.setStartedAt(Instant.now());
         instance.setStatus(WorkflowStatus.RUNNING);
         instance.setCurrentStep(stepName);
+        stampStartedAt(step);
 
         log.info("step started workflowId={} type={} step={} attempt={} status=RUNNING version={}",
-                workflowId, instance.getType(), stepName, attempt, instance.getVersion() + 1);
+                workflowId, instance.getType(), stepName, attempt, instance.getVersion());
         return attempt;
     }
 
@@ -138,11 +137,11 @@ public class WorkflowExecutor {
         step.setStatus(StepStatus.COMPLETED);
         step.setOutputJson(result.outputJson());
         step.setError(null);
-        step.setCompletedAt(Instant.now());
         entityManager.lock(instance, LockModeType.OPTIMISTIC_FORCE_INCREMENT);
+        stampCompletedAt(step);
 
         log.info("step completed workflowId={} type={} step={} attempt={} status=COMPLETED version={}",
-                workflowId, instance.getType(), step.getName(), step.getAttempt(), instance.getVersion() + 1);
+                workflowId, instance.getType(), step.getName(), step.getAttempt(), instance.getVersion());
     }
 
     private void completeLastStep(UUID workflowId, int position, ActivityResult result) {
@@ -151,14 +150,14 @@ public class WorkflowExecutor {
         step.setStatus(StepStatus.COMPLETED);
         step.setOutputJson(result.outputJson());
         step.setError(null);
-        step.setCompletedAt(Instant.now());
         instance.setStatus(WorkflowStatus.COMPLETED);
         instance.setCurrentStep(step.getName());
         instance.setOutputJson(result.outputJson());
         instance.setError(null);
+        stampCompletedAt(step);
 
         log.info("workflow completed workflowId={} type={} step={} attempt={} status=COMPLETED version={}",
-                workflowId, instance.getType(), step.getName(), step.getAttempt(), instance.getVersion() + 1);
+                workflowId, instance.getType(), step.getName(), step.getAttempt(), instance.getVersion());
     }
 
     private void failStep(UUID workflowId, int position, ActivityResult result) {
@@ -166,7 +165,6 @@ public class WorkflowExecutor {
         WorkflowStepEntity step = stepAt(instance, position);
         step.setStatus(StepStatus.FAILED);
         step.setError(result.error());
-        step.setCompletedAt(Instant.now());
         if (result.outputJson() != null) {
             step.setOutputJson(result.outputJson());
         }
@@ -174,9 +172,26 @@ public class WorkflowExecutor {
         instance.setCurrentStep(step.getName());
         instance.setError(result.error());
         instance.setOutputJson(null);
+        stampCompletedAt(step);
 
         log.info("workflow failed workflowId={} type={} step={} attempt={} status=FAILED version={}",
-                workflowId, instance.getType(), step.getName(), step.getAttempt(), instance.getVersion() + 1);
+                workflowId, instance.getType(), step.getName(), step.getAttempt(), instance.getVersion());
+    }
+
+    private void stampStartedAt(WorkflowStepEntity step) {
+        stampTimestamp(step, "update workflow_step set started_at = now() where id = :id");
+    }
+
+    private void stampCompletedAt(WorkflowStepEntity step) {
+        stampTimestamp(step, "update workflow_step set completed_at = now() where id = :id");
+    }
+
+    private void stampTimestamp(WorkflowStepEntity step, String sql) {
+        entityManager.flush();
+        entityManager.createNativeQuery(sql)
+                .setParameter("id", step.getId())
+                .executeUpdate();
+        entityManager.refresh(step);
     }
 
     private static WorkflowStepEntity stepAt(WorkflowInstanceEntity instance, int position) {

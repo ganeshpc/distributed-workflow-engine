@@ -106,6 +106,7 @@ class WorkflowDurabilityTest {
             assertThat(still.getVersion()).isEqualTo(reloaded.getVersion());
         } finally {
             second.close();
+            ActivityBlockHook.clear();
         }
     }
 

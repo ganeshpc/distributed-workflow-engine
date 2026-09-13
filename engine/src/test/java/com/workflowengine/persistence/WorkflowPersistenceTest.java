@@ -1,0 +1,129 @@
+package com.workflowengine.persistence;
+
+import com.workflowengine.api.StepStatus;
+import com.workflowengine.api.WorkflowStatus;
+import org.flywaydb.core.Flyway;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+
+import java.util.List;
+import java.util.UUID;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE)
+@Testcontainers
+class WorkflowPersistenceTest {
+
+    private static final List<String> ORDER_STEPS = List.of(
+            "CREATE_ORDER",
+            "RESERVE_INVENTORY",
+            "PROCESS_PAYMENT",
+            "CREATE_SHIPMENT",
+            "SEND_NOTIFICATION"
+    );
+
+    @Container
+    @ServiceConnection
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16");
+
+    @Autowired
+    private WorkflowInstanceRepository instanceRepository;
+
+    @Autowired
+    private WorkflowStepRepository stepRepository;
+
+    @Autowired
+    private Flyway flyway;
+
+    @Test
+    void persistsInstanceWithFiveStepsAndReloads() {
+        assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("1");
+
+        String idempotencyKey = "order-" + UUID.randomUUID();
+        WorkflowInstanceEntity saved = persistOrderInstance(idempotencyKey);
+
+        WorkflowInstanceEntity reloaded = instanceRepository.findById(saved.getId()).orElseThrow();
+
+        assertThat(reloaded.getIdempotencyKey()).isEqualTo(idempotencyKey);
+        assertThat(instanceRepository.findByIdempotencyKey(idempotencyKey))
+                .map(WorkflowInstanceEntity::getId)
+                .contains(saved.getId());
+        assertThat(reloaded.getVersion()).isZero();
+        assertThat(reloaded.getStatus()).isEqualTo(WorkflowStatus.PENDING);
+        assertThat(reloaded.getCreatedAt()).isNotNull();
+        assertThat(reloaded.getUpdatedAt()).isNotNull();
+        assertThat(reloaded.getSteps()).hasSize(5);
+        assertThat(reloaded.getSteps())
+                .extracting(WorkflowStepEntity::getName)
+                .containsExactlyElementsOf(ORDER_STEPS);
+        assertThat(reloaded.getSteps())
+                .extracting(WorkflowStepEntity::getPosition)
+                .containsExactly(0, 1, 2, 3, 4);
+        assertThat(reloaded.getSteps())
+                .extracting(WorkflowStepEntity::getStatus)
+                .containsOnly(StepStatus.PENDING);
+
+        List<WorkflowStepEntity> ordered = stepRepository
+                .findByWorkflowInstanceIdOrderByPositionAsc(saved.getId());
+        assertThat(ordered)
+                .extracting(WorkflowStepEntity::getPosition)
+                .containsExactly(0, 1, 2, 3, 4);
+        assertThat(ordered)
+                .extracting(WorkflowStepEntity::getName)
+                .containsExactlyElementsOf(ORDER_STEPS);
+    }
+
+    @Test
+    void duplicateIdempotencyKeyIsRejected() {
+        String idempotencyKey = "dup-key-" + UUID.randomUUID();
+        persistOrderInstance(idempotencyKey);
+
+        assertThatThrownBy(() -> persistOrderInstance(idempotencyKey))
+                .isInstanceOf(DataIntegrityViolationException.class);
+    }
+
+    @Test
+    void duplicateStepPositionIsRejected() {
+        WorkflowInstanceEntity instance = persistOrderInstance("pos-" + UUID.randomUUID());
+
+        WorkflowStepEntity duplicate = newStep("DUPLICATE_POS", 0);
+        duplicate.setWorkflowInstance(instanceRepository.getReferenceById(instance.getId()));
+
+        assertThatThrownBy(() -> stepRepository.saveAndFlush(duplicate))
+                .isInstanceOf(DataIntegrityViolationException.class);
+    }
+
+    private WorkflowInstanceEntity persistOrderInstance(String idempotencyKey) {
+        WorkflowInstanceEntity instance = new WorkflowInstanceEntity();
+        instance.setId(UUID.randomUUID());
+        instance.setType("ORDER");
+        instance.setDefinitionVersion(1);
+        instance.setStatus(WorkflowStatus.PENDING);
+        instance.setInputJson("{\"customerId\":\"cust-9\"}");
+        instance.setIdempotencyKey(idempotencyKey);
+
+        for (int i = 0; i < ORDER_STEPS.size(); i++) {
+            instance.addStep(newStep(ORDER_STEPS.get(i), i));
+        }
+
+        return instanceRepository.saveAndFlush(instance);
+    }
+
+    private static WorkflowStepEntity newStep(String name, int position) {
+        WorkflowStepEntity step = new WorkflowStepEntity();
+        step.setId(UUID.randomUUID());
+        step.setName(name);
+        step.setPosition(position);
+        step.setStatus(StepStatus.PENDING);
+        step.setAttempt(0);
+        return step;
+    }
+}

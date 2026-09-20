@@ -48,6 +48,14 @@ curl -s http://localhost:8080/actuator/health
 # {"status":"UP"}
 ```
 
+Interactive Swagger UI (try-it-out against this process):
+
+```text
+open http://localhost:8080/swagger-ui.html
+# or: http://localhost:8080/swagger-ui/index.html
+# OpenAPI JSON: http://localhost:8080/v3/api-docs
+```
+
 Start an ORDER workflow, then poll until it finishes:
 
 ```text
@@ -483,6 +491,8 @@ Base path `/api/v1`. JSON. No auth (localhost).
 |---|---|---|
 | `POST` | `/api/v1/workflows` | Admit. `201` + Location + admit body, or `200` existing snapshot |
 | `GET` | `/api/v1/workflows/{id}` | Current snapshot, steps by `position` |
+| `GET` | `/swagger-ui.html` | Interactive Swagger UI (try-it-out) |
+| `GET` | `/v3/api-docs` | OpenAPI 3 JSON |
 
 No list, cancel, signal, GET-by-key, or `?wait=` in this phase.
 
@@ -534,7 +544,7 @@ Testcontainers starts its own `postgres:16`. You do not need Compose for tests.
 
 | Class | What it proves |
 |---|---|
-| `WorkflowApiTest` | HTTP admit snapshot, poll to terminal, idempotency, `failAt`, 400/404/413 |
+| `WorkflowApiTest` | HTTP admit snapshot, poll to terminal, idempotency, `failAt`, 400/404/413, Swagger UI |
 | `WorkflowExecutionTest` | Version 10, `failAt`, concurrent admit, blocked-stub admit snapshot |
 | `WorkflowDurabilityTest` | Second connection sees `RUNNING`; new context re-invokes (Phase 2) |
 | `WorkflowRecoveryTest` | Never-started `PENDING` completes; `FAILED` not retried |

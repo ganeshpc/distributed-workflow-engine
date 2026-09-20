@@ -5,6 +5,14 @@ import com.workflowengine.application.AdmissionResult;
 import com.workflowengine.application.GetWorkflowService;
 import com.workflowengine.application.InvalidStartWorkflowException;
 import com.workflowengine.application.StartWorkflowService;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.headers.Header;
+import io.swagger.v3.oas.annotations.media.Content;
+import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import io.swagger.v3.oas.annotations.responses.ApiResponses;
+import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -34,6 +42,7 @@ import java.util.UUID;
 @RestController
 @RequiredArgsConstructor
 @RequestMapping("/api/v1/workflows")
+@Tag(name = "Workflows", description = "Admit and query ORDER workflows")
 public class WorkflowController {
 
     private final StartWorkflowService startWorkflowService;
@@ -48,6 +57,29 @@ public class WorkflowController {
      * @throws InvalidStartWorkflowException mapped to 400
      */
     @PostMapping
+    @Operation(
+            summary = "Admit an ORDER workflow",
+            description = "Commits instance PENDING plus five PENDING steps, then submits "
+                    + "the executor on another thread. The 201 body is that admit snapshot "
+                    + "(version 0), not a terminal status. Poll GET for COMPLETED or FAILED. "
+                    + "The same idempotencyKey returns 200 and does not start a second run."
+    )
+    @ApiResponses({
+            @ApiResponse(
+                    responseCode = "201",
+                    description = "Admitted. Location points at GET by id.",
+                    headers = @Header(name = "Location", description = "/api/v1/workflows/{id}"),
+                    content = @Content(schema = @Schema(implementation = WorkflowResponse.class))
+            ),
+            @ApiResponse(
+                    responseCode = "200",
+                    description = "Idempotent retry; existing snapshot at current status.",
+                    content = @Content(schema = @Schema(implementation = WorkflowResponse.class))
+            ),
+            @ApiResponse(responseCode = "400", description = "Unknown type, missing key, or invalid input"),
+            @ApiResponse(responseCode = "413", description = "Body larger than 64 KB"),
+            @ApiResponse(responseCode = "503", description = "Database unreachable on this request thread")
+    })
     public ResponseEntity<WorkflowResponse> start(@RequestBody StartWorkflowRequest request) {
         AdmissionResult admission = startWorkflowService.start(toCommand(request));
         WorkflowResponse body = WorkflowResponses.from(admission.snapshot(), objectMapper);
@@ -65,7 +97,23 @@ public class WorkflowController {
      * @throws com.workflowengine.application.WorkflowNotFoundException mapped to 404
      */
     @GetMapping("/{id}")
-    public WorkflowResponse get(@PathVariable("id") UUID id) {
+    @Operation(
+            summary = "Get workflow snapshot",
+            description = "Committed state including leftovers (PENDING never-started, "
+                    + "RUNNING mid-step, FAILED). Steps are ordered by position."
+    )
+    @ApiResponses({
+            @ApiResponse(
+                    responseCode = "200",
+                    description = "Current snapshot",
+                    content = @Content(schema = @Schema(implementation = WorkflowResponse.class))
+            ),
+            @ApiResponse(responseCode = "404", description = "Unknown id")
+    })
+    public WorkflowResponse get(
+            @Parameter(description = "Server-generated workflow id", required = true)
+            @PathVariable("id") UUID id
+    ) {
         return WorkflowResponses.from(getWorkflowService.get(id), objectMapper);
     }
 

@@ -5,9 +5,15 @@ import com.workflowengine.api.activity.ActivityContext;
 import com.workflowengine.api.activity.ActivityResult;
 import org.springframework.stereotype.Component;
 
+/**
+ * In-process stub for {@code RESERVE_INVENTORY}. No inventory table; canned JSON only.
+ *
+ * <p>Spring singleton invoked from {@code workflow-*} threads.
+ */
 @Component
 public class ReserveInventoryActivity implements Activity {
 
+    /** Step name this stub registers as. */
     public static final String NAME = "RESERVE_INVENTORY";
 
     @Override
@@ -20,6 +26,9 @@ public class ReserveInventoryActivity implements Activity {
         return StubSupport.execute(NAME, context);
     }
 
+    /**
+     * @return process-wide invoke count for durability tests
+     */
     public static int invocationCount() {
         return StubInvocationCounters.get(NAME);
     }

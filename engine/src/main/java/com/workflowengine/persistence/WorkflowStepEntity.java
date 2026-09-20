@@ -19,6 +19,17 @@ import org.hibernate.annotations.DynamicUpdate;
 import java.time.Instant;
 import java.util.UUID;
 
+/**
+ * JPA mapping of {@code workflow_step}. Order is {@code position}, unique per
+ * instance together with {@code name}.
+ *
+ * <p>Phase 1 keeps {@code input_json} SQL {@code NULL}. {@code started_at} and
+ * {@code completed_at} are stamped with PostgreSQL {@code now()}. A leftover
+ * {@code RUNNING} row is the crash-mid-invoke contract; Phase 1 does not
+ * re-invoke it.
+ *
+ * <p>Not thread-safe. Lombok generates getters, setters, and the JPA constructor.
+ */
 @Getter
 @Setter
 @NoArgsConstructor
@@ -27,41 +38,52 @@ import java.util.UUID;
 @DynamicUpdate
 public class WorkflowStepEntity {
 
+    /** Server-generated primary key. */
     @Id
     @Column(name = "id", nullable = false)
     private UUID id;
 
+    /** Owning instance. */
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
     @JoinColumn(name = "workflow_instance_id", nullable = false)
     private WorkflowInstanceEntity workflowInstance;
 
+    /** Activity name, unique per instance. */
     @Column(name = "name", nullable = false, length = 64)
     private String name;
 
+    /** Zero-based definition index; unique per instance. */
     @Column(name = "position", nullable = false)
     private int position;
 
+    /** Step lifecycle. */
     @Enumerated(EnumType.STRING)
     @Column(name = "status", nullable = false, length = 32)
     private StepStatus status;
 
+    /** Incremented on each start TX; 0 while {@code PENDING}. */
     @Column(name = "attempt", nullable = false)
     private int attempt;
 
+    /** Phase 1 always null; chaining is a later product decision. */
     @Column(name = "input_json", columnDefinition = "jsonb")
     @ColumnTransformer(write = "?::jsonb")
     private String inputJson;
 
+    /** Activity output JSON, or null. */
     @Column(name = "output_json", columnDefinition = "jsonb")
     @ColumnTransformer(write = "?::jsonb")
     private String outputJson;
 
+    /** Failure message; set on {@code FAILED}. */
     @Column(name = "error", columnDefinition = "text")
     private String error;
 
+    /** Database clock at start TX. */
     @Column(name = "started_at")
     private Instant startedAt;
 
+    /** Database clock at success or failure TX. */
     @Column(name = "completed_at")
     private Instant completedAt;
 }

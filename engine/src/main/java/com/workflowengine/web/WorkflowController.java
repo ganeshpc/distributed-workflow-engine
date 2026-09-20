@@ -19,6 +19,18 @@ import tools.jackson.databind.ObjectMapper;
 import java.net.URI;
 import java.util.UUID;
 
+/**
+ * REST adapter for admit-then-run. Maps HTTP JSON to
+ * {@link StartWorkflowCommand} and snapshots back to Jackson 3 JSON.
+ *
+ * <p>POST returns the TX1 snapshot ({@code PENDING}, {@code version = 0}) with
+ * {@code 201} and {@code Location}, or {@code 200} for an idempotent retry.
+ * The request thread does not run the executor. GET is how clients wait for
+ * {@code COMPLETED} or {@code FAILED}.
+ *
+ * <p>Request-thread singleton. Validation failures become 400; missing ids
+ * 404. Executor leftovers remain 200 on GET.
+ */
 @RestController
 @RequiredArgsConstructor
 @RequestMapping("/api/v1/workflows")
@@ -28,6 +40,13 @@ public class WorkflowController {
     private final GetWorkflowService getWorkflowService;
     private final ObjectMapper objectMapper;
 
+    /**
+     * Admits an ORDER workflow. {@code 201} is not terminal.
+     *
+     * @param request JSON body; {@code type}, {@code idempotencyKey}, object {@code input}
+     * @return TX1 body on create, existing snapshot on idempotent retry
+     * @throws InvalidStartWorkflowException mapped to 400
+     */
     @PostMapping
     public ResponseEntity<WorkflowResponse> start(@RequestBody StartWorkflowRequest request) {
         AdmissionResult admission = startWorkflowService.start(toCommand(request));
@@ -38,11 +57,25 @@ public class WorkflowController {
         return ResponseEntity.ok(body);
     }
 
+    /**
+     * Returns the committed snapshot, including leftovers.
+     *
+     * @param id workflow id
+     * @return current snapshot
+     * @throws com.workflowengine.application.WorkflowNotFoundException mapped to 404
+     */
     @GetMapping("/{id}")
     public WorkflowResponse get(@PathVariable("id") UUID id) {
         return WorkflowResponses.from(getWorkflowService.get(id), objectMapper);
     }
 
+    /**
+     * Serializes {@code input} to JSON text. Non-object input is rejected.
+     *
+     * @param request HTTP body
+     * @return engine command
+     * @throws InvalidStartWorkflowException when the body is missing or input is not an object
+     */
     private StartWorkflowCommand toCommand(StartWorkflowRequest request) {
         if (request == null) {
             throw new InvalidStartWorkflowException("command is required");

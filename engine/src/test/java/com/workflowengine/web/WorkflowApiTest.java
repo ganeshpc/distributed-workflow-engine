@@ -33,6 +33,13 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+/**
+ * HTTP Phase 1 acceptance: TX1 {@code 201} body, poll GET to terminal,
+ * idempotent {@code 200}, {@code failAt}, 400/404/413, health-only actuator.
+ *
+ * <p>Uses Testcontainers Postgres. Stubs are reset per test. The blocked-first
+ * stub case proves the request thread does not wait for the saga.
+ */
 @SpringBootTest
 @AutoConfigureMockMvc
 @Testcontainers

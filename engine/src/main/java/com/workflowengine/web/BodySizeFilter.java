@@ -19,12 +19,28 @@ import java.io.InputStreamReader;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 
+/**
+ * Caps {@code /api/} POST, PUT, and PATCH bodies at 64 KB.
+ *
+ * <p>If {@code Content-Length} is present and too large, responds 413 without
+ * reading. If it is absent, counts bytes and throws
+ * {@link PayloadTooLargeException} at 65536 + 1. Runs at highest precedence
+ * on the request thread. Not a Tomcat multipart setting.
+ */
 @Component
 @Order(Ordered.HIGHEST_PRECEDENCE)
 public class BodySizeFilter extends OncePerRequestFilter {
 
+    /** Maximum accepted body size in bytes (64 KiB). */
     static final int MAX_BYTES = 65_536;
 
+    /**
+     * Enforces the limit then continues the chain.
+     *
+     * @param request HTTP request
+     * @param response HTTP response
+     * @param filterChain remaining filters
+     */
     @Override
     protected void doFilterInternal(
             HttpServletRequest request,
@@ -49,6 +65,12 @@ public class BodySizeFilter extends OncePerRequestFilter {
         filterChain.doFilter(new LimitedRequest(request), response);
     }
 
+    /**
+     * Limits mutating {@code /api/} requests only.
+     *
+     * @param request HTTP request
+     * @return true when the 64 KB cap applies
+     */
     private static boolean shouldLimit(HttpServletRequest request) {
         String method = request.getMethod();
         if (!"POST".equalsIgnoreCase(method)
@@ -60,6 +82,12 @@ public class BodySizeFilter extends OncePerRequestFilter {
         return uri != null && uri.startsWith("/api/");
     }
 
+    /**
+     * Writes the generic 413 JSON body if the response is still open.
+     *
+     * @param response HTTP response
+     * @throws IOException if writing fails
+     */
     static void writeTooLarge(HttpServletResponse response) throws IOException {
         if (response.isCommitted()) {
             return;
@@ -71,11 +99,17 @@ public class BodySizeFilter extends OncePerRequestFilter {
         response.getWriter().write("{\"error\":\"Payload Too Large\"}");
     }
 
+    /**
+     * Wraps the body so missing {@code Content-Length} still hits the cap.
+     */
     static final class LimitedRequest extends HttpServletRequestWrapper {
 
         private ServletInputStream inputStream;
         private BufferedReader reader;
 
+        /**
+         * @param request original request whose stream will be counted
+         */
         LimitedRequest(HttpServletRequest request) {
             super(request);
         }
@@ -103,11 +137,17 @@ public class BodySizeFilter extends OncePerRequestFilter {
         }
     }
 
+    /**
+     * Counts bytes and throws {@link PayloadTooLargeException} past {@link #MAX_BYTES}.
+     */
     static final class LimitedServletInputStream extends ServletInputStream {
 
         private final ServletInputStream delegate;
         private int count;
 
+        /**
+         * @param delegate underlying stream
+         */
         LimitedServletInputStream(ServletInputStream delegate) {
             this.delegate = delegate;
         }
@@ -130,6 +170,10 @@ public class BodySizeFilter extends OncePerRequestFilter {
             return n;
         }
 
+        /**
+         * @param n bytes just read
+         * @throws PayloadTooLargeException when the running total exceeds the cap
+         */
         private void increment(int n) {
             count += n;
             if (count > MAX_BYTES) {

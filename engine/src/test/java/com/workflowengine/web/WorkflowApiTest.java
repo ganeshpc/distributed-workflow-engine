@@ -34,7 +34,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
- * HTTP Phase 1 acceptance: TX1 {@code 201} body, poll GET to terminal,
+ * HTTP Phase 1 acceptance: admit {@code 201} body, poll GET to terminal,
  * idempotent {@code 200}, {@code failAt}, 400/404/413, health-only actuator.
  *
  * <p>Uses Testcontainers Postgres. Stubs are reset per test. The blocked-first
@@ -81,7 +81,7 @@ class WorkflowApiTest {
     }
 
     @Test
-    void postReturnsTx1ThenGetReachesCompleted() throws Exception {
+    void postReturnsAdmitSnapshotThenGetReachesCompleted() throws Exception {
         String key = "http-happy-" + UUID.randomUUID();
         MvcResult created = mockMvc.perform(post("/api/v1/workflows")
                         .contentType(MediaType.APPLICATION_JSON)
@@ -90,11 +90,11 @@ class WorkflowApiTest {
                 .andExpect(header().string("Location", startsWith("/api/v1/workflows/")))
                 .andReturn();
 
-        JsonNode tx1 = read(created);
-        assertTx1Body(tx1);
-        assertThat(tx1.path("input").path("customerId").asString()).isEqualTo("cust-9");
-        assertThat(tx1.path("input").path("amountCents").asInt()).isEqualTo(4999);
-        UUID id = UUID.fromString(tx1.path("id").asString());
+        JsonNode admit = read(created);
+        assertAdmitSnapshot(admit);
+        assertThat(admit.path("input").path("customerId").asString()).isEqualTo("cust-9");
+        assertThat(admit.path("input").path("amountCents").asInt()).isEqualTo(4999);
+        UUID id = UUID.fromString(admit.path("id").asString());
         assertThat(created.getResponse().getHeader("Location")).isEqualTo("/api/v1/workflows/" + id);
 
         JsonNode done = pollUntilTerminal(id);
@@ -108,7 +108,7 @@ class WorkflowApiTest {
     }
 
     @Test
-    void postReturnsTx1WhileFirstStubIsBlocked() throws Exception {
+    void postReturnsAdmitSnapshotWhileFirstStubIsBlocked() throws Exception {
         ActivityBlockHook.install(CreateOrderActivity.NAME);
         String key = "http-block-" + UUID.randomUUID();
 
@@ -118,9 +118,9 @@ class WorkflowApiTest {
                 .andExpect(status().isCreated())
                 .andReturn();
 
-        JsonNode tx1 = read(created);
-        assertTx1Body(tx1);
-        UUID id = UUID.fromString(tx1.path("id").asString());
+        JsonNode admit = read(created);
+        assertAdmitSnapshot(admit);
+        UUID id = UUID.fromString(admit.path("id").asString());
 
         assertThat(ActivityBlockHook.awaitBlocked(CreateOrderActivity.NAME, Duration.ofSeconds(5))).isTrue();
         assertThat(CreateOrderActivity.invocationCount()).isEqualTo(1);
@@ -312,7 +312,7 @@ class WorkflowApiTest {
         throw new AssertionError("workflow " + id + " did not reach terminal state; last=" + latest);
     }
 
-    private static void assertTx1Body(JsonNode body) {
+    private static void assertAdmitSnapshot(JsonNode body) {
         assertThat(body.path("status").asString()).isEqualTo("PENDING");
         assertThat(body.path("version").asInt()).isZero();
         assertThat(body.path("currentStep").isNull()).isTrue();

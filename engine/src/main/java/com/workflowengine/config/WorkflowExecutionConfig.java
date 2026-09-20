@@ -7,7 +7,7 @@ import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
 /**
  * Executor used to run {@link com.workflowengine.runtime.WorkflowExecutor}
- * after TX1 commits.
+ * after the admit transaction commits.
  *
  * <p>Daemon threads, prefix {@code workflow-}. Shutdown does not wait for
  * in-flight sagas: leftovers stay in Postgres for Phase 2. This bean is a

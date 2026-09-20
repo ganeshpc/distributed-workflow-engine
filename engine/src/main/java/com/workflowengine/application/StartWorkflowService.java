@@ -30,9 +30,9 @@ import java.util.UUID;
  * to the executor or repositories directly.
  *
  * <p><strong>Admit-then-run</strong> and <strong>idempotent admission</strong>:
- * TX1 inserts the instance as {@code PENDING}, {@code version = 0},
+ * the admit transaction inserts the instance as {@code PENDING}, {@code version = 0},
  * {@code current_step} null, and every step {@code PENDING}. The returned
- * snapshot is that TX1 aggregate. Callers must not reload it after submit.
+ * snapshot is that admit aggregate. Callers must not reload it after submit.
  * Concurrent posts with the same key serialize on
  * {@code uq_workflow_instance_idempotency_key}. Only the INSERT winner
  * submits the executor. The unique-violation path returns the existing
@@ -57,14 +57,14 @@ public class StartWorkflowService {
     private final TransactionTemplate transactionTemplate;
 
     /**
-     * Wires admission. The transaction template is built here so TX1 is
+     * Wires admission. The transaction template is built here so the admit transaction is
      * explicit and not a class-level {@code @Transactional} around invoke.
      *
      * @param instances instance repository
      * @param definitions type registry
-     * @param workflowExecutor runner submitted after TX1
+     * @param workflowExecutor runner submitted after the admit transaction
      * @param workflowTaskExecutor pool that must not be the request thread
-     * @param transactionManager used only for TX1 insert
+     * @param transactionManager used only for admit insert
      */
     public StartWorkflowService(
             WorkflowInstanceRepository instances,
@@ -84,7 +84,7 @@ public class StartWorkflowService {
      * Admits a workflow on the HTTP request thread.
      *
      * @param command validated type, key, and input JSON; must not be null
-     * @return TX1 snapshot when {@code created} is true; current snapshot otherwise
+     * @return admit snapshot when {@code created} is true; current snapshot otherwise
      * @throws InvalidStartWorkflowException when type, key, or input is invalid
      * @apiNote {@code 201} is not terminal. Poll GET.
      */
@@ -140,7 +140,7 @@ public class StartWorkflowService {
     }
 
     /**
-     * TX1: insert instance {@code PENDING} plus one {@code PENDING} step per
+     * Admit transaction: insert instance {@code PENDING} plus one {@code PENDING} step per
      * definition position. Flushes so unique-key races surface here.
      *
      * @param command admit command

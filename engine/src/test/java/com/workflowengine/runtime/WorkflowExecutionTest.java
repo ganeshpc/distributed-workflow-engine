@@ -41,7 +41,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * State-machine tests without HTTP: happy path {@code version == 10},
- * {@code failAt}, concurrent admit, unknown type, and blocked-stub TX1.
+ * {@code failAt}, concurrent admit, unknown type, and blocked-stub admit snapshot.
  *
  * <p>Uses Testcontainers Postgres. Does not mock the database.
  */
@@ -91,7 +91,7 @@ class WorkflowExecutionTest {
                 "{\"customerId\":\"cust-9\",\"amountCents\":4999}"
         ));
 
-        assertTx1Snapshot(admission);
+        assertAdmitSnapshot(admission);
 
         WorkflowInstanceEntity done = WorkflowAwait.awaitTerminal(
                 instances, admission.snapshot().id(), TERMINAL_TIMEOUT);
@@ -254,7 +254,7 @@ class WorkflowExecutionTest {
                 .isInstanceOf(InvalidStartWorkflowException.class);
     }
 
-    private static void assertTx1Snapshot(AdmissionResult admission) {
+    private static void assertAdmitSnapshot(AdmissionResult admission) {
         assertThat(admission.created()).isTrue();
         WorkflowSnapshot snapshot = admission.snapshot();
         assertThat(snapshot.status()).isEqualTo(WorkflowStatus.PENDING);

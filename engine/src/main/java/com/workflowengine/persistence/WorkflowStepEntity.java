@@ -61,7 +61,7 @@ public class WorkflowStepEntity {
     @Column(name = "status", nullable = false, length = 32)
     private StepStatus status;
 
-    /** Incremented on each start TX; 0 while {@code PENDING}. */
+    /** Incremented on each step-start transaction; 0 while {@code PENDING}. */
     @Column(name = "attempt", nullable = false)
     private int attempt;
 
@@ -79,11 +79,11 @@ public class WorkflowStepEntity {
     @Column(name = "error", columnDefinition = "text")
     private String error;
 
-    /** Database clock at start TX. */
+    /** Database clock at step-start. */
     @Column(name = "started_at")
     private Instant startedAt;
 
-    /** Database clock at success or failure TX. */
+    /** Database clock at complete or fail. */
     @Column(name = "completed_at")
     private Instant completedAt;
 }

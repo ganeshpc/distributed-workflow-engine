@@ -117,11 +117,11 @@ These are decided. They are not open questions. Phase 1 implementation forks tha
 | Module layout | Parent + `engine-api` + `engine` only | `engine-api` is the shared contract (statuses, snapshots, `Activity*`). Empty `workers-*` modules are refused. |
 | `engine-api` dependencies | JDK only. No Spring, JPA, Kafka, Jackson, Lombok. JSON travels as `String` (UTF-8 JSON text). | Workers must depend on contracts, not the Boot app and not a JSON library we picked for them. |
 | Lombok | **`engine` only.** `@Getter`/`@Setter`/`@NoArgsConstructor` on JPA entities; `@Slf4j`; `@RequiredArgsConstructor` for simple injection. Never `@Data` / `@EqualsAndHashCode` on entities. | Cuts boilerplate in the Boot module. `engine-api` stays a plain JDK jar so workers do not inherit an annotation processor. |
-| Execution model (Phase 1) | **Admit-then-run.** TX1 commits instance+steps. `POST` returns `201` + `Location` + id. An in-process executor thread then runs the saga. Still one JVM, no Kafka. | Sync-to-terminal was convenient and lost the only handle on crash-during-POST. GET is how tests wait for `COMPLETED`. |
+| Execution model (Phase 1) | **Admit-then-run.** The admit transaction commits instance+steps. `POST` returns `201` + `Location` + id. An in-process executor thread then runs the saga. Still one JVM, no Kafka. | Sync-to-terminal was convenient and lost the only handle on crash-during-POST. GET is how tests wait for `COMPLETED`. |
 | Wait-for-terminal on POST | **Not** in the Phase 1 API | A `?wait=true` flag would ossify "POST is complete" and is unnecessary once the id is in the `201`. Curl uses `POST` then `GET`. |
 | Units of work | **Commit-before-invoke.** Activity `execute` is never inside an open workflow transaction. See [Units of work](#units-of-work-phase-1). | A single `@Transactional` around start+run rolls back `RUNNING` on crash and falsifies the Phase 1 guarantee. |
 | Crash mid-step (Phase 1) | After a committed `RUNNING` write, invoke. On restart, leave it `RUNNING`. Do **not** auto-resume. Do **not** start the executor on idempotent `200`. | Auto-resume without activity idempotency double-executes. Recovery is **Planned** Phase 2. |
-| Version column | Integer `version` on `workflow_instance`, mapped as JPA **`@Version` only** | Do **not** also write `version = version + 1` in custom SQL. One increment per instance-touching TX. Happy-path terminal `version = 10` (see transition table). |
+| Version column | Integer `version` on `workflow_instance`, mapped as JPA **`@Version` only** | Do **not** also write `version = version + 1` in custom SQL. One increment per instance-touching transaction. Happy-path terminal `version = 10` (see transition table). |
 | Step order | `workflow_step.position INT NOT NULL` + `UNIQUE (workflow_instance_id, position)` | Names are not an order. `ORDER BY started_at` fails for `PENDING` tails. |
 | Inter-step I/O | Every activity receives `workflowInputJson` re-serialized from the instance `input_json` row (same JSON **value** for every step). `stepInputJson` is **null**. Engine does **not** chain `output_json`. | JSONB will not preserve request whitespace/key order. Chaining is a later product decision. |
 | Instance `output_json` | On instance `COMPLETED`, copy the last step’s `output_json`. On `FAILED` / in-flight, `null`. | The column is not a zombie and is not an aggregate of all steps. |
@@ -262,7 +262,7 @@ flowchart TB
     Stubs[activity.stub.*\nNOT business services]
     Repos[Spring Data repos]
     Ctrl --> App
-    App -->|TX1 commit then submit| Pool
+    App -->|admit transaction, then submit| Pool
     Pool --> Exec
     App --> DefReg
     Exec --> DefReg
@@ -298,10 +298,10 @@ Phase 1 `ORDER` is a static, versionable, ordered list of steps. No branches, no
 
 ```mermaid
 stateDiagram-v2
-  [*] --> PENDING: TX1 admit instance + 5 PENDING steps
-  PENDING --> RUNNING: TX first step start
-  RUNNING --> COMPLETED: TX last step COMPLETED
-  RUNNING --> FAILED: TX any step FAILED
+  [*] --> PENDING: admit: instance + 5 PENDING steps
+  PENDING --> RUNNING: first step-start
+  RUNNING --> COMPLETED: workflow-complete
+  RUNNING --> FAILED: step-fail
   COMPLETED --> [*]
   FAILED --> [*]
 
@@ -319,7 +319,7 @@ Step-level machine (same four states in Phase 1):
 
 ```mermaid
 stateDiagram-v2
-  [*] --> PENDING: created in TX1
+  [*] --> PENDING: created in admit transaction
   PENDING --> RUNNING: commit RUNNING then invoke
   RUNNING --> COMPLETED: activity returned success
   RUNNING --> FAILED: ActivityResult.success=false
@@ -339,24 +339,35 @@ This is load-bearing. Implementers who wrap `StartWorkflowService` or `WorkflowE
 
 **Rule:** every state transition is its own committed transaction. `Activity.execute` runs with **no** open workflow transaction.
 
-| TX | Writes | Then |
-|---|---|---|
-| **TX1 Admission** | `INSERT` instance `PENDING`, `version=0`, `definition_version=1`, `current_step=NULL`, `output_json=NULL` **and** five steps `PENDING`, `position=0..4`, `attempt=0`, null timestamps / I/O / error. One commit. | HTTP thread may return `201`. Only the INSERT winner submits the executor. |
-| **TX2 First start** | First step → `RUNNING`, `attempt=1`, `started_at=now()`; instance → `RUNNING`, `current_step=CREATE_ORDER`. `@Version` 0→1. | **Commit. Then** invoke. |
-| **TX 2k+1 Step start** (steps 2–5) | That step → `RUNNING`, `attempt++`, `started_at=now()`; instance `current_step=name`. `@Version` +1. | **Commit. Then** invoke. |
-| **TX 2k+2 Step success** (steps 1–4) | Step → `COMPLETED`, `output_json`, `completed_at=now()`, `error=NULL`; instance unchanged except `@Version` +1. | Next start TX. |
-| **TX last success** | Last step → `COMPLETED` **and** instance → `COMPLETED`, `current_step=SEND_NOTIFICATION`, `output_json` = last step output, `error=NULL`. One commit. `@Version` +1. | Stop. |
-| **TX step failure** | Failed step → `FAILED`, `error`, `completed_at=now()` (yes, set on failure); instance → `FAILED`, `current_step` = failed step, `error` = copy of step error, `output_json=NULL`. One commit. `@Version` +1. | Stop. Later steps stay `PENDING`. |
+Named transactions (do not number them TX1/TX2):
 
-Fold instance `PENDING→RUNNING` into TX2 (first step start). Do **not** add a separate instance-only `RUNNING` transaction — that would be an extra `version++` and a crash window with instance `RUNNING` and all steps `PENDING`.
+| Name | Meaning |
+|---|---|
+| **Admit transaction** | First commit: instance + steps `PENDING`. The `201` body is this snapshot. |
+| **First step-start transaction** | First step `RUNNING` and instance `PENDING→RUNNING` in one commit. Then invoke. |
+| **Step-start transaction** | Later steps `PENDING→RUNNING`. Then invoke. |
+| **Mid-step complete transaction** | A non-last step `COMPLETED`. Instance stays `RUNNING`. |
+| **Workflow-complete transaction** | Last step `COMPLETED` and instance `COMPLETED` in one commit. |
+| **Step-fail transaction** | Failed step and instance `FAILED` in one commit. |
+
+| Transaction | Writes | Then |
+|---|---|---|
+| **Admit** | `INSERT` instance `PENDING`, `version=0`, `definition_version=1`, `current_step=NULL`, `output_json=NULL` **and** five steps `PENDING`, `position=0..4`, `attempt=0`, null timestamps / I/O / error. One commit. | HTTP thread may return `201`. Only the INSERT winner submits the executor. |
+| **First step-start** | First step → `RUNNING`, `attempt=1`, `started_at=now()`; instance → `RUNNING`, `current_step=CREATE_ORDER`. `@Version` 0→1. | **Commit. Then** invoke. |
+| **Step-start** (steps 2–5) | That step → `RUNNING`, `attempt++`, `started_at=now()`; instance `current_step=name`. `@Version` +1. | **Commit. Then** invoke. |
+| **Mid-step complete** (steps 1–4) | Step → `COMPLETED`, `output_json`, `completed_at=now()`, `error=NULL`; instance unchanged except `@Version` +1. | Next step-start transaction. |
+| **Workflow-complete** | Last step → `COMPLETED` **and** instance → `COMPLETED`, `current_step=SEND_NOTIFICATION`, `output_json` = last step output, `error=NULL`. One commit. `@Version` +1. | Stop. |
+| **Step-fail** | Failed step → `FAILED`, `error`, `completed_at=now()` (yes, set on failure); instance → `FAILED`, `current_step` = failed step, `error` = copy of step error, `output_json=NULL`. One commit. `@Version` +1. | Stop. Later steps stay `PENDING`. |
+
+Fold instance `PENDING→RUNNING` into the **first step-start** transaction. Do **not** add a separate instance-only `RUNNING` transaction — that would be an extra `version++` and a crash window with instance `RUNNING` and all steps `PENDING`.
 
 Do **not** commit last-step `COMPLETED` and instance `COMPLETED` in two transactions — that crash window is instance `RUNNING` + five `COMPLETED` steps, which a step scanner cannot repair.
 
 ### Transition table (the implementable contract)
 
-`N` is instance `@Version` **after** the TX commits. Start of life is `N=0` (admission). Happy-path terminal is **`N=10`**.
+`N` is instance `@Version` **after** the transaction commits. Start of life is `N=0` (admission). Happy-path terminal is **`N=10`**.
 
-| Event | From instance | From step | To instance | To step | `version` after TX | `current_step` after TX | Other columns |
+| Event | From instance | From step | To instance | To step | `version` after commit | `current_step` after commit | Other columns |
 |---|---|---|---|---|---|---|---|
 | Admit | — | — | `PENDING` | five × `PENDING` | 0 | `NULL` | `definition_version=1`; step `position=0..4`; `attempt=0` |
 | Start step 1 | `PENDING` | step0 `PENDING` | `RUNNING` | step0 `RUNNING` | 1 | `CREATE_ORDER` | `attempt=1`; `started_at=now()` |
@@ -378,9 +389,9 @@ Do **not** commit last-step `COMPLETED` and instance `COMPLETED` in two transact
 - `COMPLETED`: last step name (`SEND_NOTIFICATION`).
 - `FAILED`: the step that failed.
 
-`failAt=PROCESS_PAYMENT` (step index 2): versions 0,1,2,3,4,5 then fail TX → instance `FAILED`, `current_step=PROCESS_PAYMENT`, `version=6`. Steps 0–1 `COMPLETED`, step 2 `FAILED`, steps 3–4 `PENDING`.
+`failAt=PROCESS_PAYMENT` (step index 2): versions 0,1,2,3,4,5 then the step-fail transaction → instance `FAILED`, `current_step=PROCESS_PAYMENT`, `version=6`. Steps 0–1 `COMPLETED`, step 2 `FAILED`, steps 3–4 `PENDING`.
 
-`failAt=CREATE_ORDER`: TX2 starts step 0 (`version=1`), invoke fails, fail TX → instance `FAILED`, `current_step=CREATE_ORDER`, `version=2`. Steps 1–4 `PENDING`.
+`failAt=CREATE_ORDER`: first step-start commits step 0 (`version=1`), invoke fails, step-fail transaction → instance `FAILED`, `current_step=CREATE_ORDER`, `version=2`. Steps 1–4 `PENDING`.
 
 Unknown `failAt` value: all stubs succeed (they only fail on exact name match).
 
@@ -394,7 +405,7 @@ com.workflowengine
     BodySizeFilter
     RestExceptionHandler
   application
-    StartWorkflowService             TX1 + submit executor; idempotent reload
+    StartWorkflowService             admit transaction + submit executor; idempotent reload
     GetWorkflowService
   domain
     WorkflowDefinition
@@ -413,7 +424,7 @@ com.workflowengine
       CreateShipmentActivity
       SendNotificationActivity
   runtime
-    WorkflowExecutor                 one TX per transition; invoke outside TX
+    WorkflowExecutor                 one transaction per transition; invoke outside it
   persistence
     entities, Spring Data, Flyway-aligned
 ```
@@ -588,7 +599,7 @@ There is **no** `idx_workflow_step_instance`. `UNIQUE (workflow_instance_id, nam
 | Column | Phase 1 use | Why not later |
 |---|---|---|
 | `idempotency_key` unique NOT NULL | Safe POST retry; crash handle | Optional keys need a list API we do not have |
-| `version` + `@Version` | One increment per instance-touching TX | Multi-instance and recovery need it |
+| `version` + `@Version` | One increment per instance-touching transaction | Multi-instance and recovery need it |
 | `definition_version` | Written from `OrderWorkflowDefinition.version()` | Resume against a renamed Java list is undefined without it |
 | `position` | Snapshot order; executor walk | `ORDER BY started_at` is wrong for `PENDING` tails |
 | `attempt` | Set to 1 when the step first starts | Phase 2 retry must not add a column under load |
@@ -599,16 +610,16 @@ There is **no** `idx_workflow_step_instance`. `UNIQUE (workflow_instance_id, nam
 
 | When | `status` | `attempt` | `input_json` | `output_json` | `error` | `started_at` | `completed_at` |
 |---|---|---|---|---|---|---|---|
-| TX1 insert | `PENDING` | 0 | `NULL` | `NULL` | `NULL` | `NULL` | `NULL` |
-| Step start TX | `RUNNING` | increment (0→1 in Phase 1) | stays `NULL` | `NULL` | `NULL` | `now()` | `NULL` |
-| Success TX | `COMPLETED` | unchanged | `NULL` | result JSON | `NULL` | unchanged | `now()` |
-| Failure TX | `FAILED` | unchanged | `NULL` | optional stub output or `NULL` | non-null message | unchanged | `now()` |
+| Admit | `PENDING` | 0 | `NULL` | `NULL` | `NULL` | `NULL` | `NULL` |
+| Step-start | `RUNNING` | increment (0→1 in Phase 1) | stays `NULL` | `NULL` | `NULL` | `now()` | `NULL` |
+| Mid-step complete / workflow-complete | `COMPLETED` | unchanged | `NULL` | result JSON | `NULL` | unchanged | `now()` |
+| Step-fail | `FAILED` | unchanged | `NULL` | optional stub output or `NULL` | non-null message | unchanged | `now()` |
 
-Instance write protocol (same TXs):
+Instance write protocol (same transactions):
 
 | When | `status` | `current_step` | `output_json` | `error` | `updated_at` |
 |---|---|---|---|---|---|
-| TX1 | `PENDING` | `NULL` | `NULL` | `NULL` | `now()` |
+| Admit | `PENDING` | `NULL` | `NULL` | `NULL` | `now()` |
 | First start | `RUNNING` | first step name | `NULL` | `NULL` | `now()` |
 | Mid success | `RUNNING` | unchanged until next start | `NULL` | `NULL` | `now()` |
 | Later start | `RUNNING` | that step name | `NULL` | `NULL` | `now()` |
@@ -711,11 +722,11 @@ public interface ActivityInvoker {
 - Never throws to `WorkflowExecutor` for lookup misses or stub/business failures.
 - Does not interpret `failAt`. Stubs do.
 
-`WorkflowExecutor` treats any `success=false` as the failure TX above. Persistence and optimistic-lock failures on the **executor thread** are infrastructure, not step `FAILED`: do not retry the activity, do not mark the step `FAILED`, log and stop. See [Executor-thread infrastructure failures](#executor-thread-infrastructure-failures-phase-1).
+`WorkflowExecutor` treats any `success=false` as the step-fail transaction above. Persistence and optimistic-lock failures on the **executor thread** are infrastructure, not step `FAILED`: do not retry the activity, do not mark the step `FAILED`, log and stop. See [Executor-thread infrastructure failures](#executor-thread-infrastructure-failures-phase-1).
 
 ### Inter-step I/O (**Phase 1**)
 
-- `workflowInputJson` is the JSON **value** re-serialized from the instance `input_json` row after TX1. Every step of that instance receives an identical string. It is **not** the original HTTP request bytes: JSONB will not preserve whitespace or key order. Tests must not `assertEquals` against the raw POST body.
+- `workflowInputJson` is the JSON **value** re-serialized from the instance `input_json` row after the admit transaction. Every step of that instance receives an identical string. It is **not** the original HTTP request bytes: JSONB will not preserve whitespace or key order. Tests must not `assertEquals` against the raw POST body.
 - `stepInputJson` = `null`. Step row `input_json` stays SQL `NULL`.
 - The engine does **not** pass step N-1 `output_json` into step N.
 - Stubs may read `failAt` from `workflowInputJson` only.
@@ -723,7 +734,7 @@ public interface ActivityInvoker {
 
 ### Optimistic locking protocol
 
-JPA `@Version` on `WorkflowInstanceEntity.version` is the **only** incrementer. Each TX that loads the instance, mutates it (and/or its steps via the instance aggregate), and commits increments `version` by exactly 1.
+JPA `@Version` on `WorkflowInstanceEntity.version` is the **only** incrementer. Each transaction that loads the instance, mutates it (and/or its steps via the instance aggregate), and commits increments `version` by exactly 1.
 
 Do not write `SET version = version + 1` in Flyway or `@Modifying` queries. That double-increments or fights Hibernate.
 
@@ -737,7 +748,7 @@ Admit-then-run means most executor work has **no** HTTP request to fail.
 
 | Where | What | Client sees |
 |---|---|---|
-| Request thread (POST/GET) | Validation, TX1, unique-violation reload, GET load | `400` / `404` / `413` / `503` (DB unreachable on that request) / `500` (unexpected on that request). Generic body; no SQL. |
+| Request thread (POST/GET) | Validation, admit transaction, unique-violation reload, GET load | `400` / `404` / `413` / `503` (DB unreachable on that request) / `500` (unexpected on that request). Generic body; no SQL. |
 | Executor / `TaskExecutor` thread | Persistence failure, `@Version` conflict, unexpected runtime while applying a transition | Log at ERROR with `workflowId`. **Stop.** Do not retry the activity. Do not convert to step `FAILED`. Instance stays at the last **committed** leftover (`PENDING` never-started, or `RUNNING` mid-step) from the [Phase 1 leftover table](#phase-1-non-guarantees--leftovers-the-later-scanner-must-see). Subsequent `GET` is **`200`** with that leftover. Phase 2 may resume it. |
 
 A controller that calls `executor.run()` on the request thread violates admit-then-run and is out of spec.
@@ -785,34 +796,34 @@ sequenceDiagram
 
   Client->>API: POST /api/v1/workflows
   API->>Start: StartWorkflowCommand
-  Start->>DB: TX1 INSERT instance PENDING + 5 steps
+  Start->>DB: admit INSERT instance PENDING + 5 steps
   alt unique_violation on idempotency_key
     Start->>DB: SELECT by idempotency_key
     Start-->>API: existing snapshot
     API-->>Client: 200 OK (do not submit executor)
   else inserted
-    Note over DB: TX1 committed - id is durable
+    Note over DB: admit committed - id is durable
     Start->>Pool: submit run(id)
-    Start-->>API: TX1 snapshot (do not re-load)
+    Start-->>API: admit snapshot (do not re-load)
     API-->>Client: 201 + Location + PENDING version=0
   end
 
-  Note over API,Client: 201 body is always the TX1 aggregate. Transition table is normative.
+  Note over API,Client: 201 body is always the admit aggregate. Transition table is normative.
 
   Pool->>Exec: run(id)
-  Exec->>DB: TX2 position 0 RUNNING + instance RUNNING
+  Exec->>DB: first step-start: position 0 RUNNING + instance RUNNING
   Note over DB: committed - visible on a second connection
-  Exec->>Inv: invoke (no open TX)
+  Exec->>Inv: invoke (no open workflow transaction)
   Inv-->>Exec: success
-  Exec->>DB: TX complete position 0
+  Exec->>DB: mid-step complete position 0
   loop positions 1..3
-    Exec->>DB: TX start position n RUNNING
+    Exec->>DB: step-start position n RUNNING
     Exec->>Inv: invoke
-    Exec->>DB: TX complete position n
+    Exec->>DB: mid-step complete position n
   end
-  Exec->>DB: TX start position 4 RUNNING
+  Exec->>DB: step-start position 4 RUNNING
   Exec->>Inv: invoke
-  Exec->>DB: TX last-success: position 4 COMPLETED + instance COMPLETED
+  Exec->>DB: workflow-complete: position 4 COMPLETED + instance COMPLETED
 
   Client->>API: GET /api/v1/workflows/{id}
   API->>DB: load instance + steps ORDER BY position
@@ -828,9 +839,9 @@ sequenceDiagram
   participant DB as PostgreSQL
 
   Client->>Eng: POST /api/v1/workflows
-  Eng->>DB: TX1 admit COMMIT
+  Eng->>DB: admit COMMIT
   Eng-->>Client: 201 + id
-  Eng->>DB: TX2 CREATE_ORDER RUNNING COMMIT
+  Eng->>DB: first step-start CREATE_ORDER RUNNING COMMIT
   Eng->>DB: CREATE_ORDER COMPLETED COMMIT
   Eng->>DB: RESERVE_INVENTORY RUNNING COMMIT
   Note over Eng: stub begins (no real side effect in Phase 1)
@@ -854,7 +865,7 @@ sequenceDiagram
   participant DB as PostgreSQL
 
   Client->>Eng: POST key=order-1001
-  Eng->>DB: TX1 admit COMMIT
+  Eng->>DB: admit COMMIT
   Eng--xClient: connection reset before 201
   Note over Client: client has no UUID
   Client->>Eng: POST key=order-1001 (retry)
@@ -868,7 +879,7 @@ If the first request won the INSERT, it may also have submitted the executor bef
 
 **Phase 1 guarantees:**
 
-- TX1 commit makes the id durable. Retry with the same required key returns that id.
+- The admit commit makes the id durable. Retry with the same required key returns that id.
 - Anything committed before a crash is visible after restart.
 - A second DB connection can observe `step=RUNNING` **while** `Activity.execute` is still running (the durability test).
 - A completed workflow stays completed across restart.
@@ -879,10 +890,10 @@ If the first request won the INSERT, it may also have submitted the executor bef
 
 | Leftover | How it happens | Phase 1 | Phase 2 |
 |---|---|---|---|
-| Instance `PENDING`, all steps `PENDING` | Crash after TX1 before TX2, submit lost, or executor-thread infra failure before TX2 | Stuck; client has id via key retry; `GET` is `200` | **Resume:** start first step |
+| Instance `PENDING`, all steps `PENDING` | Crash after admit before first step-start, submit lost, or executor-thread infra failure before first step-start | Stuck; client has id via key retry; `GET` is `200` | **Resume:** start first step |
 | Instance `RUNNING`, one step `RUNNING`, earlier `COMPLETED`, later `PENDING` | Crash during invoke after `RUNNING` commit, or executor-thread infra failure after that commit | Stuck; no second invoke; `GET` is `200` | **Resume:** re-invoke that `RUNNING` step (`attempt++`) |
 | Instance `FAILED`, some `COMPLETED`, one `FAILED`, rest `PENDING` | `failAt` or stub failure | Terminal | **Do not retry** until a retry policy exists |
-| Instance `RUNNING`, all steps `COMPLETED` | Must **not** occur if last-success is one TX | Not an expected leftover | N/A if Phase 1 holds the TX rule |
+| Instance `RUNNING`, all steps `COMPLETED` | Must **not** occur if workflow-complete is one transaction | Not an expected leftover | N/A if Phase 1 holds the one-transaction rule |
 
 We do **not** list "client may never learn the id" as a remaining hole: the key is required and retry is specified.
 
@@ -905,7 +916,7 @@ sequenceDiagram
   W->>K: activity.results
   K->>Exec: result consumer
   Exec->>DB: complete or fail step (@Version)
-  Exec->>DB: next start TX or already terminal
+  Exec->>DB: next step-start or already terminal
 ```
 
 Outbox variant (**Planned**, replace the dashed publish — do not keep both):
@@ -917,7 +928,7 @@ sequenceDiagram
   participant Relay as Outbox relay
   participant K as Kafka
 
-  Exec->>DB: one TX: step RUNNING + outbox row
+  Exec->>DB: one transaction: step RUNNING + outbox row
   Relay->>DB: claim unpublished outbox
   Relay->>K: publish
   Relay->>DB: mark published
@@ -955,19 +966,19 @@ Request:
 
 Responses:
 
-- `201 Created` — new instance. Headers: `Location: /api/v1/workflows/{id}`. Body is **exactly** the in-memory TX1 snapshot: `status=PENDING`, `version=0`, `currentStep=null`, five steps `PENDING` in `position` order, `output=null`. Do **not** re-load the instance after `submit`. A fast executor must not change this body. This is not a terminal promise; `GET` is how clients observe progress.
+- `201 Created` — new instance. Headers: `Location: /api/v1/workflows/{id}`. Body is **exactly** the in-memory admit snapshot: `status=PENDING`, `version=0`, `currentStep=null`, five steps `PENDING` in `position` order, `output=null`. Do **not** re-load the instance after `submit`. A fast executor must not change this body. This is not a terminal promise; `GET` is how clients observe progress.
 - `200 OK` — `idempotencyKey` already existed (including unique-violation on insert → reload). Body: existing snapshot at current status. **Do not** re-run and **do not** submit the executor. No requirement to compare payloads. Same key + different input still returns the original instance (payload compare is **Planned** if abuse shows up).
 - `400 Bad Request` — unknown type, malformed JSON, missing `input`, missing/blank/too-long key.
 - `413 Payload Too Large` — body larger than 64 KB (see Security).
 - `503 Service Unavailable` — database unreachable **on this request thread**.
-- `500 Internal Server Error` — unexpected failure **on this request thread** (TX1, reload, GET load). Body is a generic error; **no** SQLSTATE, SQL text, or connection string. Executor-thread failures are **not** HTTP `500` — see [Executor-thread infrastructure failures](#executor-thread-infrastructure-failures-phase-1).
+- `500 Internal Server Error` — unexpected failure **on this request thread** (admit, reload, GET load). Body is a generic error; **no** SQLSTATE, SQL text, or connection string. Executor-thread failures are **not** HTTP `500` — see [Executor-thread infrastructure failures](#executor-thread-infrastructure-failures-phase-1).
 
 Admission algorithm (normative):
 
 1. Validate.
-2. Begin TX1; `INSERT` instance + steps.
+2. Begin the **admit transaction**; `INSERT` instance + steps.
 3. On unique-key violation (constraint `uq_workflow_instance_idempotency_key` / `DataIntegrityViolationException`): roll back, `SELECT` by key, if found return `200` + snapshot; if not found (shouldn't happen) `500`.
-4. On success: commit TX1, submit `WorkflowExecutor.run(id)` to the `TaskExecutor`, return `201` + `Location` + **the TX1 aggregate already in hand**. Do not `SELECT` again after submit.
+4. On success: commit the admit transaction, submit `WorkflowExecutor.run(id)` to the `TaskExecutor`, return `201` + `Location` + **the admit aggregate already in hand**. Do not `SELECT` again after submit.
 
 Two concurrent POSTs with the same key: one INSERT wins and submits once; the loser takes the unique-violation path and returns `200`.
 
@@ -1018,7 +1029,7 @@ No `POST /signals`, no `POST /cancel`, no `GET /workflows` list in Phase 1.
 
 ### API evolution
 
-Phase 1 `201` means *the instance exists* and the body is the TX1 snapshot, not *the saga finished*. Tests assert that body, then poll `GET`. Phase 5 keeps this admission shape; only the executor side changes (Kafka instead of `TaskExecutor`). We will not need to break the POST contract to go async.
+Phase 1 `201` means *the instance exists* and the body is the admit snapshot, not *the saga finished*. Tests assert that body, then poll `GET`. Phase 5 keeps this admission shape; only the executor side changes (Kafka instead of `TaskExecutor`). We will not need to break the POST contract to go async.
 
 ---
 
@@ -1072,7 +1083,7 @@ If Phase 1 review finds the seam already clean, this phase is a thin PR or a ski
 
 - Compose gains Kafka.
 - New module: `worker` (one). Depends on `engine-api`. Hosts the five `Activity` classes. **Ignores `failAt` unless `spring.profiles.active=test`.**
-- `WorkflowExecutor` is rewritten: commit `RUNNING`, publish (or outbox), return; a result consumer applies complete/fail TXs.
+- `WorkflowExecutor` is rewritten: commit `RUNNING`, publish (or outbox), return; a result consumer applies complete/fail transactions.
 - `InProcessActivityInvoker` is not "implemented" by Kafka.
 - First cut: persist-then-publish + republish scanner. Outbox replaces that path if needed.
 - **Do not** create five worker services.
@@ -1178,7 +1189,7 @@ This is the Phase 1 fork that actually affects correctness.
 | | Sync POST runs all steps, then returns id | Admit, return `201`+id, run on `TaskExecutor` |
 |---|---|---|
 | Demo curl | One call, body is `COMPLETED` | Two calls: `POST` then poll `GET` |
-| Crash during POST after some steps | Client has **no id**; key-less retry duplicates | TX1 already returned or is retryable by key; client has a handle |
+| Crash during POST after some steps | Client has **no id**; key-less retry duplicates | the admit transaction already returned or is retryable by key; client has a handle |
 | GET as SoT | Fiction until Phase 5 | True from day 1 |
 | Tests | Ossify `201` + five `COMPLETED` | Poll `GET`; Phase 5 does not break POST tests |
 | Still one JVM? | Yes | Yes |
@@ -1277,7 +1288,7 @@ This is the implementation gate. If a PR adds anything not listed, it is out of 
 
 1. `docker compose up -d` starts PostgreSQL 16 with a healthcheck. No other infrastructure.
 2. `engine` Spring Boot app starts against that database, Flyway applies `V1`, Actuator **health** is UP. Other actuator endpoints are not exposed.
-3. `POST /api/v1/workflows` with `type=ORDER` and a required `idempotencyKey` returns `201`, `Location: /api/v1/workflows/{id}`, and the **TX1 snapshot**: `status=PENDING`, `version=0`, `currentStep=null`, five `PENDING` steps, `output=null`. Tests **must not** accept an already-advanced `201` body. PR-04 proves this by blocking the first stub: `POST` returns that TX1 body **while** the stub is still blocked (executor has not finished step 0).
+3. `POST /api/v1/workflows` with `type=ORDER` and a required `idempotencyKey` returns `201`, `Location: /api/v1/workflows/{id}`, and the **admit snapshot**: `status=PENDING`, `version=0`, `currentStep=null`, five `PENDING` steps, `output=null`. Tests **must not** accept an already-advanced `201` body. PR-04 proves this by blocking the first stub: `POST` returns that admit body **while** the stub is still blocked (executor has not finished step 0).
 4. Tests poll `GET /api/v1/workflows/{id}` until `COMPLETED` (timeout ~5s). Then: five steps `COMPLETED` in `position` order 0..4, `attempt = 1`, instance `version = 10`, `definitionVersion = 1`, `currentStep = SEND_NOTIFICATION`, instance `output` equals the last step output.
 5. Unknown `type` or missing `idempotencyKey` → `400`. Unknown id → `404`. Body `> 64 KB` → `413`.
 6. A second `POST` with the same `idempotencyKey` returns `200` and the **same** `id`, does not create a second instance, and does not submit a second executor (invocation counters stay put if the first run already finished; if the first is in flight, still one executor). Unique-key-violation path is tested with concurrent POSTs, not only with a sequential SELECT-then-INSERT happy path.
@@ -1389,7 +1400,7 @@ Do not open a PR that scaffolds unused worker services, Kafka, or a designer.
 ### PR-03 — Definitions, invoker, stubs, executor, admission, durability
 
 - **Title:** Execute a linear ORDER workflow in-process with commit-before-invoke
-- **Files/components:** `WorkflowDefinition` / `StepDefinition` / `OrderWorkflowDefinition` / registry **in `engine` only** (not `engine-api`); `engine-api` `Activity`, `ActivityContext`, `ActivityResult`; `ActivityInvoker`, `InProcessActivityInvoker`, stubs with invocation counters and a test hook to **block** inside `execute`; `WorkflowExecutor` implementing the [transition table](#transition-table-the-implementable-contract) and [units of work](#units-of-work-phase-1); `StartWorkflowService` (TX1 + unique-violation reload + submit-once); transaction policy (no class-level `@Transactional` on the executor run method); tests:
+- **Files/components:** `WorkflowDefinition` / `StepDefinition` / `OrderWorkflowDefinition` / registry **in `engine` only** (not `engine-api`); `engine-api` `Activity`, `ActivityContext`, `ActivityResult`; `ActivityInvoker`, `InProcessActivityInvoker`, stubs with invocation counters and a test hook to **block** inside `execute`; `WorkflowExecutor` implementing the [transition table](#transition-table-the-implementable-contract) and [units of work](#units-of-work-phase-1); `StartWorkflowService` (admit transaction + unique-violation reload + submit-once); transaction policy (no class-level `@Transactional` on the executor run method); tests:
   - happy path: five `COMPLETED`, `version==10`, `ORDER BY position`
   - `failAt` on first and on payment; unknown `failAt` succeeds
   - **durability:** blocked stub ⇒ second connection sees committed `RUNNING` ⇒ new context does not increment invocation count
@@ -1401,7 +1412,7 @@ Do not open a PR that scaffolds unused worker services, Kafka, or a designer.
 ### PR-04 — REST start/get and Phase 1 acceptance
 
 - **Title:** REST API to start and query ORDER workflows
-- **Files/components:** `engine-api` request/snapshot DTOs (`StartWorkflowCommand` may already exist from PR-03; HTTP JSON records if separate); `com.workflowengine.web` (`WorkflowController`, `BodySizeFilter`, exception → `400`/`404`/`413`/`503`/`500` on the **request thread**); `GetWorkflowService`; `Location` on `201`; tests for HTTP codes and polling GET to terminal; **blocked-first-stub test:** `POST` returns `201` with TX1 body (`PENDING`, `version=0`, `currentStep=null`, five `PENDING` steps) while the stub is still blocked; README curl path; copy this design document into `docs/`
+- **Files/components:** `engine-api` request/snapshot DTOs (`StartWorkflowCommand` may already exist from PR-03; HTTP JSON records if separate); `com.workflowengine.web` (`WorkflowController`, `BodySizeFilter`, exception → `400`/`404`/`413`/`503`/`500` on the **request thread**); `GetWorkflowService`; `Location` on `201`; tests for HTTP codes and polling GET to terminal; **blocked-first-stub test:** `POST` returns `201` with the admit body (`PENDING`, `version=0`, `currentStep=null`, five `PENDING` steps) while the stub is still blocked; README curl path; copy this design document into `docs/`
 - **Depends on:** PR-03
 - **Description:** Closes Phase 1 HTTP surface. Domain idempotency and no-resume are already proven in PR-03; this PR maps them to status codes and pins admit-then-run at HTTP (request thread must not run the executor). After this PR the [acceptance criteria](#first-milestone-acceptance-criteria-phase-1) must all pass. Still no Kafka, no recovery scanner, no workers.
 

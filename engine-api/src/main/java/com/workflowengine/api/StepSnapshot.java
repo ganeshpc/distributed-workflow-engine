@@ -9,10 +9,10 @@ import java.time.Instant;
  * @param name step name from the definition
  * @param position zero-based index in the definition list
  * @param status step status
- * @param attempt increment on each start TX (0 while {@code PENDING})
+ * @param attempt increment on each step-start transaction (0 while {@code PENDING})
  * @param outputJson activity output JSON text, or null
  * @param error failure message, or null
- * @param startedAt database time of the start TX, or null
+ * @param startedAt database time of the step-start transaction, or null
  * @param completedAt database time of success or failure, or null
  */
 public record StepSnapshot(

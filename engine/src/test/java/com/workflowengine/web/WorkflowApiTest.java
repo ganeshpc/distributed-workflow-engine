@@ -35,7 +35,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 /**
  * HTTP Phase 1 acceptance: admit {@code 201} body, poll GET to terminal,
- * idempotent {@code 200}, {@code failAt}, 400/404/413, health-only actuator.
+ * idempotent {@code 200}, {@code failAt}, 400/404/413, health-only actuator,
+ * Swagger UI and OpenAPI spec.
  *
  * <p>Uses Testcontainers Postgres. Stubs are reset per test. The blocked-first
  * stub case proves the request thread does not wait for the saga.
@@ -293,6 +294,21 @@ class WorkflowApiTest {
                 .andExpect(jsonPath("$.status").value("UP"));
         mockMvc.perform(get("/actuator/env")).andExpect(status().isNotFound());
         mockMvc.perform(get("/actuator/heapdump")).andExpect(status().isNotFound());
+    }
+
+    @Test
+    void swaggerUiIsServed() throws Exception {
+        mockMvc.perform(get("/swagger-ui/index.html"))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    void openApiDocsDescribeWorkflows() throws Exception {
+        mockMvc.perform(get("/v3/api-docs"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.info.title").value("Distributed Workflow Engine"))
+                .andExpect(jsonPath("$.paths['/api/v1/workflows']").exists())
+                .andExpect(jsonPath("$.paths['/api/v1/workflows/{id}']").exists());
     }
 
     private JsonNode pollUntilTerminal(UUID id) throws Exception {

@@ -1,55 +1,561 @@
 # Distributed Workflow Engine
 
-Java 21 / Maven multi-module workflow orchestrator. Phase 1 is a single Spring Boot 4 process plus PostgreSQL.
+A Java 21 / Spring Boot 4.1 workflow **orchestrator**. It coordinates a linear e-commerce **ORDER** saga (create order → reserve inventory → process payment → create shipment → send notification) and stores current state in PostgreSQL.
 
-## Prerequisites
+This is **not** Temporal. There is no event-sourced history, no deterministic replay of workflow code, and no task-queue matching. The engine stores *where the saga is now* (`PENDING` / `RUNNING` / `COMPLETED` / `FAILED`) and commits each transition before it calls the next activity.
 
-- Java 21
-- Maven 3.9+
-- Docker (for PostgreSQL)
+**Current stage: Phase 2.** One Spring Boot process plus Postgres. Activities are in-process stubs (canned JSON, no real orders or payments). After a crash, a scanner resumes never-started admissions and leftover `RUNNING` steps. `FAILED` is not retried. How this maps to Kafka, workers, idempotency, and compensation is in [Current code vs the end goal](#current-code-vs-the-end-goal).
 
-## Local Postgres
+The design contract is [`docs/architecture.md`](docs/architecture.md). Agent rules are in [`AGENTS.md`](AGENTS.md).
+
+---
+
+## Table of contents
+
+1. [Quick start](#quick-start)
+2. [What the engine owns (and what it does not)](#what-the-engine-owns-and-what-it-does-not)
+3. [Repository layout](#repository-layout)
+4. [Concepts](#concepts)
+5. [Named transactions](#named-transactions)
+6. [Database](#database)
+7. [Step-by-step code flow](#step-by-step-code-flow)
+8. [Happy-path state table](#happy-path-state-table)
+9. [Scenarios](#scenarios)
+10. [What changed in Phase 2](#what-changed-in-phase-2)
+11. [Current code vs the end goal](#current-code-vs-the-end-goal)
+12. [HTTP contract](#http-contract)
+13. [Configuration](#configuration)
+14. [Tests](#tests)
+15. [Roadmap](#roadmap)
+
+---
+
+## Quick start
+
+**Prerequisites:** Java 21, Maven 3.9+, Docker.
 
 ```text
 docker compose up -d
-```
+# wait until postgres is healthy: docker compose ps
 
-Wait until the `postgres` service is healthy (`docker compose ps`). Credentials:
-
-| Setting  | Value      |
-|----------|------------|
-| Host     | localhost  |
-| Port     | 5432       |
-| Database | workflow   |
-| User     | workflow   |
-| Password | workflow   |
-
-## Run the engine
-
-```text
 mvn -pl engine -am spring-boot:run
 ```
 
-The app listens on port 8080. Health:
+Health:
 
 ```text
 curl -s http://localhost:8080/actuator/health
+# {"status":"UP"}
 ```
 
-Expect `{"status":"UP"}`.
-
-## Start an ORDER workflow
+Start an ORDER workflow, then poll until it finishes:
 
 ```text
-docker compose up -d
-# wait for postgres healthy
-mvn -pl engine -am spring-boot:run
-
 curl -sD - -X POST http://localhost:8080/api/v1/workflows \
   -H 'Content-Type: application/json' \
   -d '{"type":"ORDER","idempotencyKey":"order-1001","input":{"customerId":"cust-9","amountCents":4999}}'
 # 201 + Location: /api/v1/workflows/<id>
+# body is PENDING, version=0 — that is admission, not “saga finished”
 
 curl -s http://localhost:8080/api/v1/workflows/<id>
 # poll until status=COMPLETED
 ```
+
+Compose credentials (local only):
+
+| Setting  | Value    |
+|----------|----------|
+| Host     | localhost |
+| Port     | 5432     |
+| Database | workflow |
+| User     | workflow |
+| Password | workflow |
+
+The engine listens on **8080**. Actuator exposes **`health` only**.
+
+---
+
+## What the engine owns (and what it does not)
+
+The engine owns **orchestration metadata**: workflow id, type, definition version, status, current step, idempotency key, optimistic-lock version, per-step status/attempt/output/error/timestamps.
+
+It does **not** own orders, inventory, payments, shipments, or notifications. Phase 1/2 “activities” are stubs in `com.workflowengine.activity.stub`. They return `{"stub":true,"activity":"CREATE_ORDER"}` (and so on). They do not check stock or talk to a card network.
+
+Two consistency domains stay separate:
+
+1. **Engine metadata** — strong consistency. After a commit, `GET` sees that commit.
+2. **Business saga** — eventually consistent across real systems (planned, when stubs become workers).
+
+There is no XA / two-phase commit between those domains.
+
+---
+
+## Repository layout
+
+```
+distributed-workflow-engine/     Maven aggregator; imports Spring Boot 4.1 BOM
+  engine-api/                    JDK-only contracts (no Spring, JPA, Jackson, Lombok)
+  engine/                        Spring Boot app: HTTP, admission, executor, scanner, stubs, JPA
+  docker-compose.yml             Postgres 16 only
+  docs/architecture.md           Design contract
+  AGENTS.md                      Rules for humans and coding agents
+```
+
+**`engine-api`** (`com.workflowengine.api`): `WorkflowStatus`, `StepStatus`, `StartWorkflowCommand`, `WorkflowSnapshot`, `StepSnapshot`, `Activity`, `ActivityContext`, `ActivityResult`. JSON travels as `String`. A future `worker` module must depend on this jar only.
+
+**`engine` package map:**
+
+| Package | Role |
+|---|---|
+| `com.workflowengine.web` | REST adapters. Not named `.api`. |
+| `com.workflowengine.application` | Admit, get, snapshots. Request-thread exceptions. |
+| `com.workflowengine.domain` / `definition` | `ORDER` graph, `RetryPolicy`. |
+| `com.workflowengine.activity` | `ActivityInvoker` (sync in-process port). |
+| `com.workflowengine.activity.stub` | Demo adapters + `failAt` + test hooks. |
+| `com.workflowengine.runtime` | `WorkflowExecutor`, `WorkflowDispatcher`, `RecoveryScanner`. |
+| `com.workflowengine.persistence` | JPA entities and Spring Data. |
+| `com.workflowengine.config` | Task executor, clock, daemon scheduler. |
+
+`WorkflowExecutor` must not import the stub package. It depends on `ActivityInvoker`.
+
+---
+
+## Concepts
+
+### Admit-then-run
+
+Admission is durable **before** any activity runs. `POST` may return as soon as the instance row is committed. The saga runs on a `workflow-*` thread afterward. Clients and tests wait by polling `GET`. There is no `?wait=` flag.
+
+### Commit-before-invoke
+
+Every state transition is its own committed Postgres transaction. `Activity.execute` runs with **no** open workflow transaction. If the process dies during invoke, the last **committed** leftover is still in the database (`RUNNING` step). That is the point of the durability test.
+
+Do not put `@Transactional` on `StartWorkflowService.start` or `WorkflowExecutor.run`.
+
+### Idempotent admission
+
+`idempotencyKey` is **required** (1–128 characters). Unique index `uq_workflow_instance_idempotency_key`. Concurrent POSTs: one INSERT wins and submits the executor; the loser reloads and returns `200`. The `200` path **must not** submit the executor (Phase 2 recovery is what continues a leftover, not a retry POST).
+
+### Leftover
+
+Committed state left after a crash or a lost submit:
+
+| Leftover | Meaning |
+|---|---|
+| Instance `PENDING`, all steps `PENDING` | Admit committed; first step-start never ran (or submit was lost). |
+| Instance `RUNNING`, one step `RUNNING` | Crash during invoke after the step-start commit. |
+| Instance `FAILED` | Terminal. Phase 2 does not retry it. |
+
+### Optimistic locking
+
+JPA `@Version` on `workflow_instance.version` is the **only** incrementer. Do not write `version = version + 1` in SQL. Happy-path terminal (no crash) is **`version = 10`**.
+
+Mid-step complete transactions do not change instance status, so they use `LockModeType.OPTIMISTIC_FORCE_INCREMENT` still to bump version.
+
+### Inter-step I/O
+
+Every activity receives the same `workflowInputJson` (JSONB re-serialized from instance `input_json`). `stepInputJson` is always `null`. The engine does **not** chain step N-1 output into step N. On instance `COMPLETED`, instance `output_json` is a copy of the last step’s output. Otherwise it is `null`.
+
+### `failAt`
+
+Demo failure injection on stubs only. If input JSON contains `"failAt":"PROCESS_PAYMENT"`, that stub returns `STUB_FORCED_FAILURE`. Unknown values are ignored; all steps succeed. The invoker does not interpret `failAt`.
+
+### At-least-once (Phase 2)
+
+Re-invoking a leftover `RUNNING` step can run the stub a second time. Stubs are not idempotent. Real side effects need Phase 6 (activity idempotency). Phase 2 makes **progress** after crash; it does not make side effects exactly-once.
+
+---
+
+## Named transactions
+
+Do not number them TX1/TX2. Names describe the unit of work:
+
+| Name | Writes | Then |
+|---|---|---|
+| **Admit** | Instance `PENDING`, `version=0`, five steps `PENDING`, `attempt=0` | HTTP may return `201`. Only the INSERT winner submits the executor. |
+| **First step-start** | First step `RUNNING`, `attempt=1`, `started_at=now()`; instance `RUNNING`, `current_step=CREATE_ORDER`; `version` 0→1 | **Commit. Then** invoke. |
+| **Step-start** | Later step `RUNNING`, `attempt++`, `started_at=now()`; instance `current_step` updated; `version` +1 | **Commit. Then** invoke. |
+| **Mid-step complete** | Step `COMPLETED`, `output_json`, `completed_at=now()`; instance status unchanged; `version` +1 | Next step-start. |
+| **Workflow-complete** | Last step `COMPLETED` **and** instance `COMPLETED` in **one** commit; instance `output_json` = last step output | Stop. |
+| **Step-fail** | Step and instance `FAILED` in one commit; instance `output_json=null`; later steps stay `PENDING` | Stop. |
+| **Running-resume** (Phase 2) | Leftover `RUNNING` step: `attempt++`, `@Version` bump | **Commit. Then** invoke again. |
+
+Fold instance `PENDING→RUNNING` into first step-start. Do not add a separate instance-only `RUNNING` transaction.
+
+Last-step complete and instance complete share one transaction so you never get instance `RUNNING` + all steps `COMPLETED`.
+
+---
+
+## Database
+
+Flyway only. `spring.jpa.hibernate.ddl-auto=none`. Migrations:
+
+- `V1__init.sql` — instance + step tables, unique keys, status index, `updated_at` trigger.
+- `V2__step_next_attempt_at.sql` — Phase 2: `workflow_step.next_attempt_at` and a partial index.
+
+JSON is `JSONB`. Timestamps are `TIMESTAMPTZ` assigned by PostgreSQL (`now()`), not `Instant.now()` in Java. Tests must not assert equality with the JVM clock.
+
+### `workflow_instance`
+
+| Column | Role |
+|---|---|
+| `id` | Server-generated UUID. Not a client business id. |
+| `type` | Definition type (`ORDER`). |
+| `definition_version` | Copied from `OrderWorkflowDefinition.version()` at admit (currently 1). |
+| `status` | `PENDING` / `RUNNING` / `COMPLETED` / `FAILED`. |
+| `input_json` | Opaque workflow input. |
+| `output_json` | Last-step output on `COMPLETED`; otherwise `NULL`. |
+| `current_step` | `NULL` if never started; running/last/failed step name otherwise. |
+| `idempotency_key` | Required, unique, 1–128 chars. |
+| `version` | JPA `@Version`. Happy path ends at 10. |
+| `error` | Copy of failed step error. |
+| `created_at` / `updated_at` | DB clock. `updated_at` is a `BEFORE UPDATE` trigger. |
+
+Indexes: unique `idempotency_key`; `idx_workflow_instance_status` for the Phase 2 scanner (`WHERE status IN ('PENDING','RUNNING')`).
+
+### `workflow_step`
+
+| Column | Role |
+|---|---|
+| `id` | UUID. |
+| `workflow_instance_id` | FK to instance. |
+| `name` | Activity name (`CREATE_ORDER`, …). Unique per instance. |
+| `position` | Zero-based definition order. Unique per instance. **This** is order, not name, not `started_at`. |
+| `status` | `PENDING` / `RUNNING` / `COMPLETED` / `FAILED`. |
+| `attempt` | 0 while `PENDING`; incremented on each step-start **and** each Phase 2 running-resume. |
+| `input_json` | Always `NULL` in Phase 1/2. |
+| `output_json` | Stub/activity output. |
+| `error` | Set on `FAILED`. |
+| `started_at` / `completed_at` | DB `now()` at start / complete-or-fail. |
+| `next_attempt_at` | Phase 2. When a leftover `RUNNING` step is due. `NULL` means due now. `FAILED` ignores this. |
+
+### How rows change (happy path, no crash)
+
+Admit (one commit):
+
+```
+instance: PENDING, version=0, current_step=NULL, output_json=NULL
+steps 0..4: PENDING, attempt=0, timestamps NULL
+```
+
+After first step-start, then invoke, then mid-step complete, … through workflow-complete:
+
+See [Happy-path state table](#happy-path-state-table). Each line is one committed transaction touching the instance row (`version` +1).
+
+### How rows change (Phase 2 resume of `RUNNING`)
+
+Crash after first step-start (`version=1`, step 0 `RUNNING`, `attempt=1`). Scanner submits. Executor **running-resume**: `attempt` 1→2, `version` 1→2, then invoke, then mid-step complete (`version=3`). Later steps follow the usual table. Terminal version is **greater than 10**.
+
+---
+
+## Step-by-step code flow
+
+### A. `POST /api/v1/workflows` (request thread)
+
+1. `BodySizeFilter` (highest precedence) rejects bodies over **65536** bytes with 413.
+2. `WorkflowController.start` maps JSON to `StartWorkflowCommand` (`type`, `idempotencyKey`, `input` serialized with Jackson 3 to a `String`).
+3. `StartWorkflowService.start`:
+   - Validates type (`ORDER` only), key 1..128, non-blank input JSON. Failures → `InvalidStartWorkflowException` → HTTP 400, generic body.
+   - **Admit transaction:** insert instance `PENDING` + five `PENDING` steps (`saveAndFlush`). Unique violation on `idempotency_key` → reload by key → `AdmissionResult(created=false)` → HTTP **200**, **no submit**.
+   - INSERT winner: `WorkflowDispatcher.submit(id)` then return `AdmissionResult(created=true)` with the **in-memory admit snapshot**. Do **not** reload after submit. HTTP **201** + `Location: /api/v1/workflows/{id}`. Body is always `PENDING` / `version=0` / `currentStep=null` / five `PENDING` steps.
+4. The request thread never calls `Activity.execute`.
+
+`WorkflowDispatcher` puts the id in an in-memory inflight set and runs `WorkflowExecutor.run` on `workflowTaskExecutor` (`workflow-*` daemon threads). If the id is already inflight, submit is a no-op (scanner vs admission race).
+
+### B. Executor walk (workflow thread)
+
+`WorkflowExecutor.execute`:
+
+1. Load type, `definition_version`, and `input_json` once (**seed**). Every activity gets that same input.
+2. Resolve `OrderWorkflowDefinition` (five `StepDefinition`s, default `RetryPolicy` maxAttempts=3, backoff=0).
+3. For each position 0..4:
+   - **prepareStep** (own transaction):
+     - Instance `COMPLETED` / `FAILED` → stop.
+     - Step `COMPLETED` → skip (continue walk). This is how resume continues after earlier steps already finished.
+     - Step `FAILED` → stop.
+     - Step `PENDING` → **step-start** (`RUNNING`, `attempt++`, `started_at=now()`, instance `RUNNING`).
+     - Step `RUNNING` → **running-resume** (Phase 2): if `next_attempt_at` is in the future, stop; if `attempt+1 > maxAttempts`, **step-fail** with `RETRY_EXHAUSTED`; else `attempt++`, bump `@Version`, then invoke.
+   - **Invoke** `ActivityInvoker` with **no** workflow transaction. `InProcessActivityInvoker` looks up the stub by name. Lookup miss → `UNKNOWN_ACTIVITY`. Thrown exception → `ACTIVITY_EXCEPTION`. Stubs may honor `failAt` and test block hooks.
+   - On `success=false` → **step-fail** transaction, stop.
+   - On success, last step → **workflow-complete** (step + instance `COMPLETED` together).
+   - On success, not last → **mid-step complete**, then next position.
+
+Infrastructure failures (persistence, `@Version` conflict) are caught in `run`, logged ERROR, and **stop**. They do **not** mark the step `FAILED`. `GET` still returns 200 with the leftover. Phase 2 scanner will try again.
+
+### C. `GET /api/v1/workflows/{id}` (request thread)
+
+`GetWorkflowService` loads the instance with steps (`ORDER BY position`). Missing id → 404. Leftovers (`PENDING` / `RUNNING` / `FAILED`) are returned as-is. Executor-thread failures are never HTTP 500 on GET.
+
+### D. Recovery scanner (Phase 2)
+
+`RecoveryScanner`:
+
+- Runs once on `ApplicationReadyEvent` and every `workflow.recovery.interval-ms` (default 2000).
+- `SELECT` instances with status `PENDING` or `RUNNING` (`idx_workflow_instance_status`).
+- Due **PENDING**: all steps still `PENDING` → `dispatcher.submit`.
+- Due **RUNNING**: a `RUNNING` step with `next_attempt_at` null or ≤ now → `dispatcher.submit`.
+- Never selects `FAILED` or `COMPLETED`.
+
+Same-process duplicates: dispatcher inflight set. After a process crash the set is empty, so leftovers submit again.
+
+---
+
+## Happy-path state table
+
+`N` is instance `version` **after** the commit. No crash.
+
+| Event | Instance | Step that changed | `version` | `current_step` |
+|---|---|---|---|---|
+| Admit | `PENDING` | five × `PENDING`, `attempt=0` | 0 | `NULL` |
+| Start step 1 | `RUNNING` | `CREATE_ORDER` `RUNNING` `attempt=1` | 1 | `CREATE_ORDER` |
+| Complete step 1 | `RUNNING` | `CREATE_ORDER` `COMPLETED` | 2 | `CREATE_ORDER` |
+| Start step 2 | `RUNNING` | `RESERVE_INVENTORY` `RUNNING` | 3 | `RESERVE_INVENTORY` |
+| Complete step 2 | `RUNNING` | `RESERVE_INVENTORY` `COMPLETED` | 4 | `RESERVE_INVENTORY` |
+| Start step 3 | `RUNNING` | `PROCESS_PAYMENT` `RUNNING` | 5 | `PROCESS_PAYMENT` |
+| Complete step 3 | `RUNNING` | `PROCESS_PAYMENT` `COMPLETED` | 6 | `PROCESS_PAYMENT` |
+| Start step 4 | `RUNNING` | `CREATE_SHIPMENT` `RUNNING` | 7 | `CREATE_SHIPMENT` |
+| Complete step 4 | `RUNNING` | `CREATE_SHIPMENT` `COMPLETED` | 8 | `CREATE_SHIPMENT` |
+| Start step 5 | `RUNNING` | `SEND_NOTIFICATION` `RUNNING` | 9 | `SEND_NOTIFICATION` |
+| Complete step 5 | **`COMPLETED`** | `SEND_NOTIFICATION` `COMPLETED`; instance `output_json` = last output | **10** | `SEND_NOTIFICATION` |
+
+`failAt=PROCESS_PAYMENT`: versions 0..5, then step-fail → instance `FAILED`, `version=6`, `current_step=PROCESS_PAYMENT`. Steps 0–1 `COMPLETED`, step 2 `FAILED`, steps 3–4 `PENDING`.
+
+---
+
+## Scenarios
+
+### 1. Happy path
+
+`POST` → 201 admit snapshot → poll `GET` → `COMPLETED`, `version=10`, five `COMPLETED` steps, `attempt=1` each, instance output equals last step output.
+
+### 2. Idempotent retry
+
+Same `idempotencyKey` again → 200, same id, no second executor. If the first run already finished, stub counters do not increase.
+
+### 3. Forced failure
+
+`"failAt":"PROCESS_PAYMENT"` → `FAILED` at payment. `"failAt":"CREATE_ORDER"` → first step fails, rest `PENDING`. Unknown `failAt` → all succeed.
+
+### 4. Validation / limits
+
+Unknown `type` or missing key → 400. Unknown id → 404. Body > 64 KB → 413. Error JSON is generic (`Bad Request`, …). No SQL in the body.
+
+### 5. Crash after admit, before first step-start (Phase 2)
+
+Leftover: instance `PENDING`, all steps `PENDING`. Client retries POST → 200 + id, **does not** submit. On process start, scanner submits. Saga runs as a normal first start (`attempt=1`, terminal `version=10`).
+
+### 6. Crash during invoke (Phase 2)
+
+Leftover: instance `RUNNING`, one step `RUNNING`, `attempt=1`. Restart → scanner submits → running-resume `attempt=2` → invoke again → complete. First step ends with `attempt=2`. Terminal `version` > 10.
+
+A second JDBC connection can see `RUNNING` **while** `execute` is still blocked (commit-before-invoke). That is required; inserting a `RUNNING` row by hand is not a substitute for the automated test.
+
+### 7. Failed workflow after restart (Phase 2)
+
+`FAILED` stays `FAILED`. Scanner does not select it. Stub invocation count does not increase.
+
+### 8. Poison / retry cap (Phase 2)
+
+Default `maxAttempts=3`. First start uses attempt 1. Each running-resume increments. If the next attempt would be 4, the executor writes `RETRY_EXHAUSTED` and **step-fail**. That `FAILED` is then left alone.
+
+### 9. Executor-thread infrastructure failure
+
+Persistence or `@Version` conflict on the `workflow-*` thread: log ERROR, stop, do not mark `FAILED`. GET is 200 with leftover. Scanner may submit again.
+
+---
+
+## What changed in Phase 2
+
+Phase 1 left leftovers stuck on purpose: restart did **not** resume, and idempotent `200` did not start the executor. Phase 2 keeps the second rule and **adds a scanner** so leftovers make progress.
+
+| Area | Phase 1 | Phase 2 |
+|---|---|---|
+| Never-started `PENDING` | Stuck | Scanner starts the first step |
+| Leftover `RUNNING` | Stuck; no second invoke | Re-invoke, `attempt++` |
+| `FAILED` | Terminal | Still terminal (not retried) |
+| Idempotent POST `200` | Must not submit | Unchanged — scanner continues leftovers |
+| Schema | `V1` only | `V2`: `workflow_step.next_attempt_at` |
+| Definition | Step name only | `RetryPolicy` (max attempts, backoff) |
+| Submit path | Admission called `TaskExecutor` + executor directly | `WorkflowDispatcher` (inflight set) used by admission **and** scanner |
+| Executor walk | `startStep` only; non-`PENDING` stopped the whole run | `prepareStep`: skip `COMPLETED`, resume `RUNNING`, stop if not due / poison |
+| Startup | No scan | `RecoveryScanner` on `ApplicationReadyEvent` + every 2s |
+| Durability test | New context must **not** increment stub counter | New context **must** re-invoke (`attempt=2`) then complete |
+| Tests | 24 | 26 (`WorkflowRecoveryTest`: pending resume + failed-not-retried) |
+
+**New types:** `RetryPolicy`, `WorkflowDispatcher`, `RecoveryScanner`. **New config:** `workflow.recovery.enabled` (default true), `workflow.recovery.interval-ms` (default 2000). **Clock** bean for due-time. Daemon `TaskScheduler` so recovery ticks do not keep the JVM alive after shutdown.
+
+**Unchanged on purpose:** REST paths, admit snapshot (`201` still `PENDING`/`version=0`), no Kafka, no worker module, no compensation, no timeout poller, stubs still canned JSON.
+
+---
+
+## Current code vs the end goal
+
+The **end goal** is still this product: a **durable current-state orchestrator** (Conductor / Step Functions / saga shape), not a Temporal clone. History replay, deterministic workflow-as-code, query handlers, and multi-language SDKs stay **theoretical**. What grows is *where* work runs, *how* it is dispatched, and *how* crashes and failures are handled.
+
+Postgres remains the source of truth for orchestration metadata. Kafka, when it appears, is **transport only**.
+
+### Topology
+
+| Concern | Now (Phase 2) | End goal (planned) |
+|---|---|---|
+| Processes | One JVM: REST + executor + stubs + scanner | Engine JVM(s) + **one** worker JVM first (Phase 5). Optional later split into service-owned workers (Phase 8). |
+| Compose | Postgres only | Postgres + Kafka. No five microservices on day one of Kafka. |
+| Who runs activities | Engine thread pool (`workflow-*`), in-process stubs | Worker process implements `Activity` from `engine-api`. Engine never calls the card network or stock DB. |
+| Engine replicas | `replicas > 1` is a defect | Allowed only after out-of-process activities (5), idempotent activities (6), and `SKIP LOCKED` claim (9). |
+
+### How a step runs
+
+**Now:** commit-before-invoke is **synchronous in one process**.
+
+1. Commit step `RUNNING`.
+2. Same thread calls `InProcessActivityInvoker` → stub `Activity.execute`.
+3. Same thread commits `COMPLETED` or `FAILED`.
+
+**End goal (Phase 5):** commit-before-invoke becomes **dispatch-and-complete-later**.
+
+1. Engine commits step `RUNNING`.
+2. Engine publishes a task (first cut: persist-then-publish; outbox may **replace** that path).
+3. Engine thread **returns**. It does not `future.get()` on Kafka.
+4. Worker executes the activity (own DB for business data).
+5. Worker publishes a result keyed by `(workflowId, step, attempt)`.
+6. Engine result consumer applies the mid-step complete, workflow-complete, or step-fail transaction.
+
+`ActivityInvoker` as a blocking in-process port is a Phase 1/2 seam. Phase 5 rewrites the executor; it does not “implement Kafka by blocking.”
+
+### Recovery
+
+| Now | End goal |
+|---|---|
+| `RecoveryScanner` finds `PENDING` / `RUNNING` in Postgres and calls `WorkflowDispatcher.submit` → in-process `WorkflowExecutor.run` | Same leftover rows. Scanner **republishes** stale `RUNNING` tasks to Kafka instead of invoking locally. Lost messages are recovered from committed `RUNNING`, not from Kafka as SoT. |
+| Inflight set is in-memory (one process) | Multi-instance engines claim rows with `SELECT … FOR UPDATE SKIP LOCKED` (Phase 9). `@Version` rejects stale writers. |
+| `FAILED` is never retried | Retry policy on `FAILED` can be turned on once backoff/`next_attempt_at` are used for that path. Timeouts become `FAILED` or a later `TIMED_OUT` (Phase 3). |
+
+### Time, failure, and side effects
+
+| Concern | Now | End goal |
+|---|---|---|
+| Time | No step timeout. Backoff field exists (`next_attempt_at`) but ORDER uses zero delay. | Phase 3: poller marks overdue `RUNNING` failed-by-timeout (rows + clock, not `Thread.sleep`). Phase 10: first-class timer *steps*. |
+| Activity failure | Stub `failAt` or `success=false` → step-fail; instance `FAILED`; later steps stay `PENDING`. | Same forward fail, then **compensation** (Phase 7): reverse walk of completed steps, states `COMPENSATING` / `COMPENSATED`. Requires Phase 6. |
+| Double invoke after crash | Real: stub runs twice. Documented. Stubs have no money/stock. | Phase 6: worker idempotency store “this attempt already completed.” Effectively-once = at-least-once delivery + idempotent handler. **Hard gate** before real payment/inventory. |
+| `failAt` | Stubs honor it always. | Workers ignore `failAt` unless `spring.profiles.active=test`. |
+
+### API and definitions
+
+| Now | End goal |
+|---|---|
+| `POST` / `GET` one workflow. No list, cancel, signal, `?wait=`. | Same admit-then-run. Later: signals `POST /workflows/{id}/signals/{name}`, maybe list/cancel. Still no Temporal query handlers. |
+| Linear `ORDER` in Java (`OrderWorkflowDefinition`). | Still Java definitions unless a later phase chooses otherwise. Branching, parallel+join, timer steps (Phase 10). Not BPMN, not a designer. |
+| JSON as `String` in `engine-api`; Jackson only at HTTP. | Unchanged contract so workers never depend on `engine`. |
+
+### Data that stays vs data that appears later
+
+**Stays:** `workflow_instance` / `workflow_step` as current state. `@Version`. `definition_version`. `attempt`. `idx_workflow_instance_status`.
+
+**Already added for later use:** `next_attempt_at`, `RetryPolicy` on `StepDefinition`.
+
+**Planned tables/states, not present now:** `workflow_event` (audit/UI), outbox (if persist-then-publish drops publishes), `COMPENSATING` / `COMPENSATED` / `CANCELED` / `TIMED_OUT`, worker-side idempotency keys.
+
+### Picture
+
+```
+Now (Phase 2)
+  Client → Engine HTTP → admit commit → workflow-* thread → stub.execute → complete/fail commit
+                         ↘ crash leftover → RecoveryScanner → same thread pool → stub.execute again
+
+End goal (Phase 5–9, still current-state)
+  Client → Engine HTTP → admit commit
+       → Engine: RUNNING commit → Kafka task
+       → Worker: Activity.execute (idempotent from Phase 6)
+       → Kafka result → Engine: complete/fail commit
+       → crash leftover → scanner republishes RUNNING to Kafka (not in-process invoke)
+       → N engines: SKIP LOCKED claim; workers scaled independently
+```
+
+If a sentence in this README and [`docs/architecture.md`](docs/architecture.md) disagree, the architecture doc wins.
+
+---
+
+## HTTP contract
+
+Base path `/api/v1`. JSON. No auth (localhost).
+
+| Method | Path | Result |
+|---|---|---|
+| `POST` | `/api/v1/workflows` | Admit. `201` + Location + admit body, or `200` existing snapshot |
+| `GET` | `/api/v1/workflows/{id}` | Current snapshot, steps by `position` |
+
+No list, cancel, signal, GET-by-key, or `?wait=` in this phase.
+
+Request:
+
+```json
+{
+  "type": "ORDER",
+  "idempotencyKey": "order-1001",
+  "input": { "customerId": "cust-9", "amountCents": 4999 }
+}
+```
+
+`201` body: `status=PENDING`, `version=0`, `currentStep=null`, five `PENDING` steps, `output=null`. That is **not** terminal.
+
+Statuses: `400` validation, `404` unknown id, `413` payload too large, `503` database unreachable on the **request** thread, `500` unexpected request-thread failure (generic body, no SQL). Executor-thread failures are not HTTP 500.
+
+---
+
+## Configuration
+
+`engine/src/main/resources/application.yml`:
+
+```yaml
+server.port: 8080
+spring.datasource: jdbc:postgresql://localhost:5432/workflow
+spring.jpa.hibernate.ddl-auto: none
+spring.flyway.enabled: true
+management.endpoints.web.exposure.include: health
+workflow.recovery.enabled: true
+workflow.recovery.interval-ms: 2000
+```
+
+Set `workflow.recovery.enabled=false` only in tests that plant leftovers before a second process should resume them.
+
+---
+
+## Tests
+
+```text
+# Rancher Desktop
+export DOCKER_HOST=unix://$HOME/.rd/docker.sock
+export TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock
+
+mvn test
+```
+
+Testcontainers starts its own `postgres:16`. You do not need Compose for tests.
+
+| Class | What it proves |
+|---|---|
+| `WorkflowApiTest` | HTTP admit snapshot, poll to terminal, idempotency, `failAt`, 400/404/413 |
+| `WorkflowExecutionTest` | Version 10, `failAt`, concurrent admit, blocked-stub admit snapshot |
+| `WorkflowDurabilityTest` | Second connection sees `RUNNING`; new context re-invokes (Phase 2) |
+| `WorkflowRecoveryTest` | Never-started `PENDING` completes; `FAILED` not retried |
+| `WorkflowPersistenceTest` | Flyway v2, unique keys, `@Version` starts at 0 |
+| `BodySizeFilterTest` | 64 KB cap without Spring |
+| `WorkflowExecutorPackageTest` | Executor bytecode does not name the stub package |
+
+Manual leftover checks (SQL plant + restart) are described in the Phase 2 PR discussion; automated tests are the gate.
+
+---
+
+## Roadmap
+
+| Phase | Status | Focus |
+|---|---|---|
+| 1 | Done | Admit-then-run, stubs, REST, commit-before-invoke, no resume |
+| 2 | Done (this branch / PR-05) | Scanner, `RUNNING` re-invoke, `FAILED` left alone, retry policy + `next_attempt_at` |
+| 3 | Next | Timeout poller (durable time in Postgres) |
+| 4 | Optional | Harden `Activity` as the worker contract |
+| 5 | Planned | Kafka + **one** worker process (needs the Phase 2 scanner to republish stale `RUNNING`) |
+| 6 | Planned | Activity idempotency (required before real side effects) |
+| 7+ | Planned | Compensation, optional worker split, multi-instance engine, signals, observability |
+
+Do not run `replicas > 1` until out-of-process activities (5), idempotent activities (6), and claim/lock (9) exist.

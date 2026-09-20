@@ -9,8 +9,8 @@
  * workflow transaction.
  *
  * <p>A <strong>leftover</strong> is committed state left after a crash:
- * never-started {@code PENDING}, or a {@code RUNNING} step mid-invoke. Phase 1
- * does not resume leftovers. {@code FAILED} is terminal until a retry policy
- * exists.
+ * never-started {@code PENDING}, or a {@code RUNNING} step mid-invoke. Phase 2
+ * {@link com.workflowengine.runtime.RecoveryScanner} resumes those.
+ * {@code FAILED} stays terminal.
  */
 package com.workflowengine.runtime;

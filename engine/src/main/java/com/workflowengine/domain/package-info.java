@@ -4,6 +4,7 @@
  * <p>Definitions live in {@code engine}, not {@code engine-api}. The version
  * that ran is copied onto {@code workflow_instance.definition_version} at
  * admit so a later resume knows which graph to use. Step order is
- * {@code position}, not name.
+ * {@code position}, not name. {@link com.workflowengine.domain.RetryPolicy}
+ * applies when resuming leftover {@code RUNNING} steps.
  */
 package com.workflowengine.domain;

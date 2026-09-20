@@ -5,6 +5,7 @@ import com.workflowengine.api.StepStatus;
 import com.workflowengine.api.WorkflowStatus;
 import com.workflowengine.api.activity.ActivityContext;
 import com.workflowengine.api.activity.ActivityResult;
+import com.workflowengine.domain.RetryPolicy;
 import com.workflowengine.domain.StepDefinition;
 import com.workflowengine.domain.WorkflowDefinition;
 import com.workflowengine.domain.WorkflowDefinitionRegistry;
@@ -18,6 +19,8 @@ import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.time.Clock;
+import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 
@@ -30,13 +33,13 @@ import java.util.UUID;
  * {@code COMPLETED} share one workflow-complete transaction so a leftover of instance {@code RUNNING}
  * plus all steps {@code COMPLETED} cannot exist.
  *
- * <p><strong>Leftovers:</strong> a crash after the admit transaction before the first step-start
- * leaves instance {@code PENDING}. A crash during invoke after the step-start transaction
- * leaves a {@code RUNNING} step. Phase 1 does not resume either. {@code FAILED}
- * is terminal.
+ * <p><strong>Leftovers:</strong> Phase 2 resumes never-started {@code PENDING} and due
+ * {@code RUNNING} steps (attempt++). {@code FAILED} stays terminal. A leftover
+ * {@code RUNNING} whose next attempt would exceed {@link RetryPolicy#maxAttempts()}
+ * becomes poison {@code RETRY_EXHAUSTED}.
  *
  * <p>Runs on {@code workflow-*} threads, never the HTTP request thread. This
- * class must not import {@code activity.stub}. Infrastructure failures are
+ * class must not import the in-process stub package. Infrastructure failures are
  * logged and stop the run; they do not mark the step {@code FAILED}.
  *
  * @implNote Happy-path terminal {@code version == 10}. Mid-step success TXs
@@ -51,6 +54,7 @@ public class WorkflowExecutor {
     private final ActivityInvoker invoker;
     private final TransactionTemplate tx;
     private final EntityManager entityManager;
+    private final Clock clock;
 
     /**
      * Builds an executor that opens its own {@link TransactionTemplate} per unit of work.
@@ -60,19 +64,22 @@ public class WorkflowExecutor {
      * @param invoker sync activity port
      * @param transactionManager not used as a class-level {@code @Transactional}
      * @param entityManager used to force {@code @Version} bumps and stamp timestamps
+     * @param clock backoff due-time for leftover {@code RUNNING} steps
      */
     public WorkflowExecutor(
             WorkflowInstanceRepository instances,
             WorkflowDefinitionRegistry definitions,
             ActivityInvoker invoker,
             PlatformTransactionManager transactionManager,
-            EntityManager entityManager
+            EntityManager entityManager,
+            Clock clock
     ) {
         this.instances = instances;
         this.definitions = definitions;
         this.invoker = invoker;
         this.tx = new TransactionTemplate(transactionManager);
         this.entityManager = entityManager;
+        this.clock = clock;
     }
 
     /**
@@ -113,10 +120,14 @@ public class WorkflowExecutor {
         for (int i = 0; i < steps.size(); i++) {
             int position = i;
             StepDefinition stepDef = steps.get(position);
-            Integer attempt = tx.execute(status -> startStep(workflowId, position, stepDef.name()));
-            if (attempt == null) {
+            Prepared prepared = tx.execute(status -> prepareStep(workflowId, position, stepDef));
+            if (prepared == null || prepared.kind() == Prepared.Kind.STOP) {
                 return;
             }
+            if (prepared.kind() == Prepared.Kind.SKIP) {
+                continue;
+            }
+            int attempt = prepared.attempt();
 
             ActivityResult result = invoker.invoke(new ActivityContext(
                     workflowId,
@@ -157,36 +168,91 @@ public class WorkflowExecutor {
     }
 
     /**
-     * Step-start transaction: step {@code PENDING→RUNNING}, increment {@code attempt}, set
-     * instance {@code RUNNING} and {@code current_step}, stamp {@code started_at}.
+     * Chooses skip (already {@code COMPLETED}), stop (terminal, not due, or poison),
+     * or run (step-start / leftover resume).
      *
      * @param workflowId instance id
      * @param position step index
-     * @param stepName definition name
-     * @return attempt after increment, or null if the instance is already terminal
-     *         or the step is not {@code PENDING}
+     * @param stepDef name and retry policy
+     * @return prepared action; never null
      */
-    private Integer startStep(UUID workflowId, int position, String stepName) {
+    private Prepared prepareStep(UUID workflowId, int position, StepDefinition stepDef) {
         WorkflowInstanceEntity instance = instances.findById(workflowId).orElseThrow();
         if (instance.getStatus() == WorkflowStatus.COMPLETED
                 || instance.getStatus() == WorkflowStatus.FAILED) {
-            return null;
+            return Prepared.stop();
         }
         WorkflowStepEntity step = stepAt(instance, position);
-        if (step.getStatus() != StepStatus.PENDING) {
-            return null;
+        if (step.getStatus() == StepStatus.COMPLETED) {
+            return Prepared.skip();
         }
+        if (step.getStatus() == StepStatus.FAILED) {
+            return Prepared.stop();
+        }
+        if (step.getStatus() == StepStatus.PENDING) {
+            return Prepared.run(startStep(instance, step, stepDef.name()));
+        }
+        return resumeRunning(instance, step, stepDef.retryPolicy());
+    }
 
+    /**
+     * Step-start transaction: step {@code PENDING→RUNNING}, increment {@code attempt}, set
+     * instance {@code RUNNING} and {@code current_step}, stamp {@code started_at}.
+     *
+     * @param instance loaded aggregate
+     * @param step {@code PENDING} step
+     * @param stepName definition name
+     * @return attempt after increment
+     */
+    private int startStep(WorkflowInstanceEntity instance, WorkflowStepEntity step, String stepName) {
         int attempt = step.getAttempt() + 1;
         step.setStatus(StepStatus.RUNNING);
         step.setAttempt(attempt);
+        step.setNextAttemptAt(null);
         instance.setStatus(WorkflowStatus.RUNNING);
         instance.setCurrentStep(stepName);
         stampStartedAt(step);
 
         log.info("step started workflowId={} type={} step={} attempt={} status=RUNNING version={}",
-                workflowId, instance.getType(), stepName, attempt, instance.getVersion());
+                instance.getId(), instance.getType(), stepName, attempt, instance.getVersion());
         return attempt;
+    }
+
+    /**
+     * Resume leftover {@code RUNNING}: increment {@code attempt}, then invoke
+     * again. Not due yet → stop. Next attempt above {@code maxAttempts} →
+     * poison {@code FAILED}.
+     *
+     * @param instance loaded aggregate
+     * @param step the {@code RUNNING} step
+     * @param retryPolicy attempt cap and backoff
+     * @return run with the new attempt, or stop
+     */
+    private Prepared resumeRunning(
+            WorkflowInstanceEntity instance,
+            WorkflowStepEntity step,
+            RetryPolicy retryPolicy
+    ) {
+        Instant now = clock.instant();
+        Instant next = step.getNextAttemptAt();
+        if (next != null && next.isAfter(now)) {
+            return Prepared.stop();
+        }
+        int attempt = step.getAttempt() + 1;
+        if (attempt > retryPolicy.maxAttempts()) {
+            failStep(instance.getId(), step.getPosition(),
+                    new ActivityResult(false, null, "RETRY_EXHAUSTED"));
+            return Prepared.stop();
+        }
+        step.setAttempt(attempt);
+        step.setNextAttemptAt(retryPolicy.initialBackoff().isZero()
+                ? null
+                : now.plus(retryPolicy.initialBackoff()));
+        entityManager.lock(instance, LockModeType.OPTIMISTIC_FORCE_INCREMENT);
+
+        log.info("step resumed workflowId={} type={} step={} attempt={} status=RUNNING version={}",
+                instance.getId(), instance.getType(), step.getName(), attempt, instance.getVersion());
+        return Prepared.run(attempt);
     }
 
     /**
@@ -236,7 +302,7 @@ public class WorkflowExecutor {
 
     /**
      * Step-fail transaction: step and instance {@code FAILED}. Instance {@code output_json}
-     * stays null. Terminal until a retry policy exists.
+     * stays null. Terminal; Phase 2 does not retry {@code FAILED}.
      *
      * @param workflowId instance id
      * @param position failed step index
@@ -315,5 +381,33 @@ public class WorkflowExecutor {
      * @param inputJson workflow input JSON text
      */
     private record Seed(String type, int definitionVersion, String inputJson) {
+    }
+
+    /**
+     * Result of {@link #prepareStep}. {@code SKIP} continues the definition walk;
+     * {@code STOP} ends the run; {@code RUN} invokes with {@code attempt}.
+     *
+     * @param kind what the executor should do next
+     * @param attempt current attempt when {@code kind} is {@code RUN}; otherwise null
+     */
+    private record Prepared(Kind kind, Integer attempt) {
+
+        enum Kind {
+            STOP,
+            SKIP,
+            RUN
+        }
+
+        static Prepared stop() {
+            return new Prepared(Kind.STOP, null);
+        }
+
+        static Prepared skip() {
+            return new Prepared(Kind.SKIP, null);
+        }
+
+        static Prepared run(int attempt) {
+            return new Prepared(Kind.RUN, attempt);
+        }
     }
 }

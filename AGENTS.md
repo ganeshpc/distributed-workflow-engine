@@ -28,7 +28,7 @@ Honesty labels used in `docs/architecture.md`:
 - **Planned** — later increment. Do not start unless the user asked for that phase.
 - **Theoretical** — vocabulary only. Not committed.
 
-Current code is Phase 1 complete (PR-01..PR-04). Next planned increment is Phase 2 / PR-05 (crash recovery + retry). Do not scaffold Kafka, worker modules, compensation, signals, or a designer "for later".
+Current code is Phase 2 (PR-05): leftover scanner resumes never-started `PENDING` and due `RUNNING` steps. `FAILED` is not retried. Next planned increment is Phase 3 / PR-06 (timeout poller). Do not scaffold Kafka, worker modules, compensation, signals, or a designer "for later".
 
 ---
 
@@ -116,17 +116,17 @@ Fold instance `PENDING→RUNNING` into the **first step-start transaction**. Do 
 
 Commit last-step `COMPLETED` and instance `COMPLETED` in **one workflow-complete transaction**. A crash window of instance `RUNNING` + all steps `COMPLETED` is forbidden.
 
-### Crash contract (Phase 1)
+### Crash contract (Phase 2)
 
-After a committed `RUNNING` write, invoke. On process death or executor-thread infrastructure failure: leave the last **committed** leftover. Do **not** auto-resume. Do **not** re-invoke. Recovery is Phase 2.
+After a committed `RUNNING` write, invoke. On process death the **recovery scanner** resumes leftovers. Idempotent `200` still must not submit the executor.
 
-Expected leftovers:
-
-| Leftover | Meaning |
+| Leftover | Phase 2 |
 |---|---|
-| Instance `PENDING`, all steps `PENDING` | Crash after admit, before first step-start / submit lost |
-| Instance `RUNNING`, one step `RUNNING` | Crash during invoke after `RUNNING` commit |
-| Instance `FAILED` | Terminal until a retry policy exists |
+| Instance `PENDING`, all steps `PENDING` | Resume: start the first step |
+| Instance `RUNNING`, one step `RUNNING` | Resume: re-invoke that step (`attempt++`) when `next_attempt_at` is due |
+| Instance `FAILED` | Leave terminal. Do not retry. |
+
+Same-process double-submit is prevented by `WorkflowDispatcher`'s inflight set. `RetryPolicy.maxAttempts` caps `RUNNING` resumes; exceeding it writes `RETRY_EXHAUSTED` and `FAILED`.
 
 ### Optimistic locking
 
@@ -369,7 +369,7 @@ No Prometheus, Jaeger, ELK, or Zipkin in Compose until Phase 11.
 - `201` tests must pin the **admit snapshot**: `PENDING`, `version=0`, `currentStep=null`, all steps `PENDING`. Prove it with a blocked first stub while POST returns.
 - Poll `GET` (or repository load) until terminal with a ~5s timeout. Happy path: five `COMPLETED` in position order, `attempt = 1`, `version = 10`, `currentStep = SEND_NOTIFICATION`, instance output equals last step output.
 - `failAt=PROCESS_PAYMENT` and `failAt=CREATE_ORDER` plus unknown `failAt` are required scenarios when changing the executor or stubs.
-- Durability: block inside `execute`; a **second DB connection / new transaction** must see `RUNNING`; a **new** Spring context against the same database must not increment the stub invocation counter. Inserting a `RUNNING` row by hand is not a substitute.
+- Durability / recovery: block inside `execute`; a **second DB connection** must see `RUNNING`. A **new** Spring context against the same database must re-invoke (`attempt++`). Inserting a `RUNNING` row by hand is not a substitute. A `FAILED` instance must not be retried after restart.
 - Concurrent admit with the same key: one instance, one executor submit. Test the unique-violation path, not only sequential SELECT-then-INSERT.
 - Idempotent `200` must not submit a second executor.
 - HTTP: unknown type / missing key → `400`; unknown id → `404`; body `> 64 KB` → `413`.
@@ -423,7 +423,7 @@ Refuse even if it photographs well. Changing these requires an architecture-doc 
 - Kubernetes operators, service mesh
 - Spring Statemachine as the durability story
 - One `@Transactional` around admission + all invokes
-- Auto-resume or starting the executor on idempotent `200` (until Phase 2 is explicitly in scope)
+- Starting the executor on idempotent `200` (scanner resumes leftovers; POST `200` must not submit)
 - `replicas > 1` until Phase 5 (out-of-process activities), Phase 6 (idempotent activities), and Phase 9 (claim/lock)
 - Optional idempotency keys before a list or lookup-by-key API exists
 - Output chaining between steps

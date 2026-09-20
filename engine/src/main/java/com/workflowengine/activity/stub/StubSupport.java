@@ -6,7 +6,7 @@ import com.workflowengine.api.activity.ActivityResult;
 /**
  * Shared stub body: count, honor block hooks, then {@code failAt} or canned JSON.
  *
- * <p>Not a business service. Runs on the executor thread after the start TX
+ * <p>Not a business service. Runs on the executor thread after the step-start transaction
  * committed. {@code failAt} is interpreted here, not in the invoker.
  */
 final class StubSupport {

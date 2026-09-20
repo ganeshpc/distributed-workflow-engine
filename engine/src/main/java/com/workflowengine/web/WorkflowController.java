@@ -23,7 +23,7 @@ import java.util.UUID;
  * REST adapter for admit-then-run. Maps HTTP JSON to
  * {@link StartWorkflowCommand} and snapshots back to Jackson 3 JSON.
  *
- * <p>POST returns the TX1 snapshot ({@code PENDING}, {@code version = 0}) with
+ * <p>POST returns the admit snapshot ({@code PENDING}, {@code version = 0}) with
  * {@code 201} and {@code Location}, or {@code 200} for an idempotent retry.
  * The request thread does not run the executor. GET is how clients wait for
  * {@code COMPLETED} or {@code FAILED}.
@@ -44,7 +44,7 @@ public class WorkflowController {
      * Admits an ORDER workflow. {@code 201} is not terminal.
      *
      * @param request JSON body; {@code type}, {@code idempotencyKey}, object {@code input}
-     * @return TX1 body on create, existing snapshot on idempotent retry
+     * @return admit body on create, existing snapshot on idempotent retry
      * @throws InvalidStartWorkflowException mapped to 400
      */
     @PostMapping

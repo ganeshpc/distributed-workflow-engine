@@ -12,10 +12,10 @@ package com.workflowengine.api;
  */
 public enum StepStatus {
 
-    /** Inserted in TX1. {@code attempt} is 0; timestamps and I/O are null. */
+    /** Inserted in the admit transaction. {@code attempt} is 0; timestamps and I/O are null. */
     PENDING,
 
-    /** Start TX committed. Invoke happens after this commit, with no open workflow TX. */
+    /** Step-start transaction committed. Invoke happens after this commit, with no open workflow transaction. */
     RUNNING,
 
     /** Activity returned success; {@code output_json} and {@code completed_at} are set. */

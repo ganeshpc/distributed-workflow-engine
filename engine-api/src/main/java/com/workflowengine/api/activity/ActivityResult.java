@@ -2,7 +2,7 @@ package com.workflowengine.api.activity;
 
 /**
  * Outcome of one activity invoke. The executor treats {@code success == false}
- * as the failure TX; it never infers failure from a thrown exception because
+ * as the step-fail transaction; it never infers failure from a thrown exception because
  * the invoker already converted those.
  *
  * @param success true if the step should become {@code COMPLETED}

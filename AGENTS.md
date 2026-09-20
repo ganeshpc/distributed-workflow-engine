@@ -100,8 +100,8 @@ These are load-bearing. A PR that violates them is out of spec even if tests are
 
 ### Admit-then-run
 
-1. TX1 commits instance `PENDING` + all steps `PENDING`.
-2. HTTP may return `201` + `Location` + **the in-memory TX1 snapshot**. Do not reload after submit. A fast executor must not change the `201` body.
+1. The **admit transaction** commits instance `PENDING` + all steps `PENDING`.
+2. HTTP may return `201` + `Location` + **the in-memory admit snapshot**. Do not reload after submit. A fast executor must not change the `201` body.
 3. Only the INSERT winner submits `WorkflowExecutor.run(id)` on `workflowTaskExecutor`.
 4. Idempotent retry (unique violation on `idempotency_key`) returns the existing snapshot and **must not** submit the executor.
 5. There is no `?wait=` flag. Clients and tests poll `GET`.
@@ -112,9 +112,9 @@ Every state transition is its own committed transaction. `Activity.execute` runs
 
 Do **not** put `@Transactional` on `StartWorkflowService.start`, `WorkflowExecutor.run`, or any method that both writes workflow state and invokes an activity.
 
-Fold instance `PENDING→RUNNING` into the first step-start TX. Do **not** add a separate instance-only `RUNNING` transaction.
+Fold instance `PENDING→RUNNING` into the **first step-start transaction**. Do **not** add a separate instance-only `RUNNING` transaction.
 
-Commit last-step `COMPLETED` and instance `COMPLETED` in **one** TX. A crash window of instance `RUNNING` + all steps `COMPLETED` is forbidden.
+Commit last-step `COMPLETED` and instance `COMPLETED` in **one workflow-complete transaction**. A crash window of instance `RUNNING` + all steps `COMPLETED` is forbidden.
 
 ### Crash contract (Phase 1)
 
@@ -124,7 +124,7 @@ Expected leftovers:
 
 | Leftover | Meaning |
 |---|---|
-| Instance `PENDING`, all steps `PENDING` | Crash after TX1 before TX2 / submit lost |
+| Instance `PENDING`, all steps `PENDING` | Crash after admit, before first step-start / submit lost |
 | Instance `RUNNING`, one step `RUNNING` | Crash during invoke after `RUNNING` commit |
 | Instance `FAILED` | Terminal until a retry policy exists |
 
@@ -134,7 +134,7 @@ JPA `@Version` on `WorkflowInstanceEntity.version` is the **only** incrementer. 
 
 Happy-path terminal `version == 10`. Tests must assert that after `COMPLETED`.
 
-Mid-step success TXs that do not change instance status still bump `@Version` (use `LockModeType.OPTIMISTIC_FORCE_INCREMENT` when the instance row would otherwise be unchanged).
+Mid-step complete transactions that do not change instance status still bump `@Version` (use `LockModeType.OPTIMISTIC_FORCE_INCREMENT` when the instance row would otherwise be unchanged).
 
 ### Inter-step I/O
 
@@ -165,7 +165,7 @@ Mid-step success TXs that do not change instance status still bump `@Version` (u
 
 | Where | What | Client sees |
 |---|---|---|
-| Request thread (POST/GET) | Validation, TX1, unique-violation reload, GET load | `400` / `404` / `413` / `503` / `500`. Generic body. **No SQL.** |
+| Request thread (POST/GET) | Validation, admit transaction, unique-violation reload, GET load | `400` / `404` / `413` / `503` / `500`. Generic body. **No SQL.** |
 | Executor / `TaskExecutor` thread | Persistence, `@Version` conflict, unexpected transition failure | Log ERROR with `workflowId`. **Stop.** Do not retry the activity. Do not mark the step `FAILED`. Subsequent `GET` is `200` with the leftover. |
 
 ---
@@ -176,7 +176,7 @@ Base path `/api/v1`. JSON. No auth. Bind for local use only.
 
 | Method | Path | Contract |
 |---|---|---|
-| `POST` | `/api/v1/workflows` | Admit. `201` + `Location: /api/v1/workflows/{id}` + TX1 body, or `200` existing snapshot |
+| `POST` | `/api/v1/workflows` | Admit. `201` + `Location: /api/v1/workflows/{id}` + admit body, or `200` existing snapshot |
 | `GET` | `/api/v1/workflows/{id}` | Snapshot, steps `ORDER BY position` |
 
 Do not add list, GET-by-key, cancel, signal, or `?wait=` in Phase 1.
@@ -223,7 +223,7 @@ New migrations: `V{n}__{snake_description}.sql`. Never edit an applied `V1__init
 - Collections: never return `null` lists; use empty lists. Snapshot `steps` are ordered by `position`.
 - `Optional` is for repository `find*` misses, not for every field.
 - Do not use Spring Statemachine. The state machine is the tables plus `WorkflowExecutor`.
-- Keep methods small enough that one unit of work is obvious. A method that opens a TX must not invoke an activity.
+- Keep methods small enough that one unit of work is obvious. A method that opens a workflow transaction must not invoke an activity.
 - New Spring `@Bean` / `@Component` types need a reason. Do not add unused configuration.
 
 ### Naming
@@ -270,7 +270,7 @@ Write complete sentences. Do not restate the class name. Cover all of the follow
 
 1. **What the type represents or is responsible for.** One or two sentences. Be precise about the boundary (HTTP adapter vs admission vs executor vs persistence vs stub).
 2. **Role in the architecture** when that is not obvious from the package. Name the collaborators and the direction of the dependency. Point to the phase (`Phase 1` / `Planned`) when the type is a temporary seam (`InProcessActivityInvoker`, stubs, `failAt`).
-3. **Important invariants or lifecycle behavior.** Examples: TX1 snapshot must remain `PENDING`/`version=0`; `@Version` is the only incrementer; step `position` is order; `output_json` is copied only on instance `COMPLETED`; leftover `RUNNING` is stuck until Phase 2.
+3. **Important invariants or lifecycle behavior.** Examples: admit snapshot must remain `PENDING`/`version=0`; `@Version` is the only incrementer; step `position` is order; `output_json` is copied only on instance `COMPLETED`; leftover `RUNNING` is stuck until Phase 2.
 4. **Important concurrency or thread-safety characteristics.** Which thread runs it (Tomcat request, `workflow-` executor, later scanner). Whether two threads may touch the same instance. What the unique-key and `@Version` races mean. Whether the type is immutable, request-scoped, or a process-wide singleton.
 5. **Important failure or error-handling behavior.** What it returns vs throws. Request-thread HTTP mapping vs executor-thread log-and-stop. Invoker never throws for stub/business failure. Unique-violation reload. Generic error bodies.
 
@@ -287,7 +287,7 @@ When a type or package introduces a project concept, the Javadoc (type, `package
 | `@Version` / optimistic concurrency | `WorkflowInstanceEntity` |
 | Sync in-process `ActivityInvoker` vs later async dispatch | `ActivityInvoker`, `InProcessActivityInvoker` |
 | `failAt` demo failure injection | stub package / `StubSupport` |
-| TX1 snapshot vs polled `GET` | `WorkflowController`, `AdmissionResult` |
+| Admit snapshot vs polled `GET` | `WorkflowController`, `AdmissionResult` |
 | Engine metadata consistency vs business saga eventual consistency | `docs/architecture.md` and engine `package-info` / application types as touched |
 
 When you add a new concept (retry policy, `next_attempt_at`, outbox, compensation, `SKIP LOCKED`, …), define it in Javadoc at the first type that implements it, not only in the design doc.
@@ -296,9 +296,9 @@ When you add a new concept (retry policy, `next_attempt_at`, outbox, compensatio
 
 - First sentence is a summary that can stand in an index (end with a period).
 - `@param` every parameter: meaning, units, nullability, allowed range (for example idempotency key 1..128).
-- `@return` what the caller gets, including nullability and TX snapshot vs current snapshot.
+- `@return` what the caller gets, including nullability and admit snapshot vs current snapshot.
 - `@throws` every declared or documented unchecked exception the caller must handle (`InvalidStartWorkflowException`, `WorkflowNotFoundException`, `PayloadTooLargeException`).
-- Document side effects: which TX commits, whether the executor is submitted, whether `attempt` increments, whether a stub is invoked.
+- Document side effects: which named transaction commits, whether the executor is submitted, whether `attempt` increments, whether a stub is invoked.
 - Document thread: "runs on the HTTP request thread" vs "runs on `workflowTaskExecutor`" vs "must be called with no open workflow transaction".
 - Use `{@code …}` for types, method names, JSON fields, SQL identifiers, and status values.
 - Use `@implNote` for implementation constraints (do not reload after submit; do not catch `Exception` on the executor and convert to step `FAILED`).
@@ -325,9 +325,9 @@ When you add a new concept (retry policy, `next_attempt_at`, outbox, compensatio
  * in {@code com.workflowengine.web} call this type; they do not talk to the
  * executor or repositories directly.
  *
- * <p>Invariant: TX1 inserts the instance as {@code PENDING}, {@code version = 0},
+ * <p>Invariant: the admit transaction inserts the instance as {@code PENDING}, {@code version = 0},
  * {@code current_step} null, and every step {@code PENDING}. The returned snapshot
- * is that TX1 aggregate. Callers must not reload it after submit.
+ * is that admit aggregate. Callers must not reload it after submit.
  *
  * <p>Concurrency: many request threads may call {@link #start} at once. Concurrent
  * posts with the same idempotency key serialize on
@@ -366,7 +366,7 @@ No Prometheus, Jaeger, ELK, or Zipkin in Compose until Phase 11.
 - Do not mock PostgreSQL for state-machine tests. The point is committed visibility.
 - Do not use `Instant.now()` equality against DB timestamps.
 - Do not `assertEquals` snapshot JSON against the raw POST body (JSONB re-serializes).
-- `201` tests must pin TX1: `PENDING`, `version=0`, `currentStep=null`, all steps `PENDING`. Prove it with a blocked first stub while POST returns.
+- `201` tests must pin the **admit snapshot**: `PENDING`, `version=0`, `currentStep=null`, all steps `PENDING`. Prove it with a blocked first stub while POST returns.
 - Poll `GET` (or repository load) until terminal with a ~5s timeout. Happy path: five `COMPLETED` in position order, `attempt = 1`, `version = 10`, `currentStep = SEND_NOTIFICATION`, instance output equals last step output.
 - `failAt=PROCESS_PAYMENT` and `failAt=CREATE_ORDER` plus unknown `failAt` are required scenarios when changing the executor or stubs.
 - Durability: block inside `execute`; a **second DB connection / new transaction** must see `RUNNING`; a **new** Spring context against the same database must not increment the stub invocation counter. Inserting a `RUNNING` row by hand is not a substitute.

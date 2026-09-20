@@ -8,7 +8,7 @@ import java.util.concurrent.TimeUnit;
 /**
  * Test hook that parks a stub inside {@code execute} until {@link #release}.
  *
- * <p>Used to prove commit-before-invoke: POST can return TX1 while the first
+ * <p>Used to prove commit-before-invoke: POST can return the admit snapshot while the first
  * stub is still blocked, and a second connection sees {@code RUNNING}.
  * JVM-static; tests must {@link #clear()} so leftover latches do not stall
  * the next class. {@link #honor} runs on the executor thread.

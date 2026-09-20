@@ -13,7 +13,7 @@ import java.util.UUID;
  * @param workflowType definition type
  * @param definitionVersion version copied at admit
  * @param stepName step being invoked
- * @param attempt current attempt after the start TX incremented it
+ * @param attempt current attempt after the step-start transaction incremented it
  * @param workflowInputJson JSON text from {@code workflow_instance.input_json}; never null
  * @param stepInputJson Phase 1 always null
  */

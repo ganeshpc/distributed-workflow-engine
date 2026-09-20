@@ -13,13 +13,13 @@ package com.workflowengine.api;
  */
 public enum WorkflowStatus {
 
-    /** TX1 admit: instance exists, no step has started. {@code current_step} is null. */
+    /** Admit transaction: instance exists, no step has started. {@code current_step} is null. */
     PENDING,
 
     /** At least one step has been started; the saga is in flight or leftover. */
     RUNNING,
 
-    /** Last step committed {@code COMPLETED} in the same TX as this status. Terminal. */
+    /** Last step committed {@code COMPLETED} in the same workflow-complete transaction as this status. Terminal. */
     COMPLETED,
 
     /** A step committed {@code FAILED}. Terminal until a retry policy exists. */

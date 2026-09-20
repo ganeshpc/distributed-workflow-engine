@@ -25,13 +25,13 @@ import java.util.UUID;
  * Runs a linear ORDER saga with commit-before-invoke.
  *
  * <p>Each unit of work is its own committed transaction. {@link ActivityInvoker#invoke}
- * runs with no open workflow TX. Instance {@code PENDING→RUNNING} is folded
- * into the first step-start TX. Last-step {@code COMPLETED} and instance
- * {@code COMPLETED} share one TX so a leftover of instance {@code RUNNING}
+ * runs with no open workflow transaction. Instance {@code PENDING→RUNNING} is folded
+ * into the first step-start transaction. Last-step {@code COMPLETED} and instance
+ * {@code COMPLETED} share one workflow-complete transaction so a leftover of instance {@code RUNNING}
  * plus all steps {@code COMPLETED} cannot exist.
  *
- * <p><strong>Leftovers:</strong> a crash after TX1 before the first start TX
- * leaves instance {@code PENDING}. A crash during invoke after the start TX
+ * <p><strong>Leftovers:</strong> a crash after the admit transaction before the first step-start
+ * leaves instance {@code PENDING}. A crash during invoke after the step-start transaction
  * leaves a {@code RUNNING} step. Phase 1 does not resume either. {@code FAILED}
  * is terminal.
  *
@@ -92,7 +92,7 @@ public class WorkflowExecutor {
     }
 
     /**
-     * Walks definition steps: start TX, invoke, complete or fail TX.
+     * Walks definition steps: step-start, invoke, complete or fail.
      *
      * @param workflowId instance id
      */
@@ -157,7 +157,7 @@ public class WorkflowExecutor {
     }
 
     /**
-     * Start TX: step {@code PENDING→RUNNING}, increment {@code attempt}, set
+     * Step-start transaction: step {@code PENDING→RUNNING}, increment {@code attempt}, set
      * instance {@code RUNNING} and {@code current_step}, stamp {@code started_at}.
      *
      * @param workflowId instance id
@@ -190,7 +190,7 @@ public class WorkflowExecutor {
     }
 
     /**
-     * Mid-step success TX: step {@code COMPLETED}, force {@code @Version} bump
+     * Mid-step complete transaction: step {@code COMPLETED}, force {@code @Version} bump
      * even though instance status is unchanged.
      *
      * @param workflowId instance id
@@ -211,7 +211,7 @@ public class WorkflowExecutor {
     }
 
     /**
-     * Last-step success TX: step and instance {@code COMPLETED}, copy last
+     * Workflow-complete transaction: step and instance {@code COMPLETED}, copy last
      * output onto the instance.
      *
      * @param workflowId instance id
@@ -235,7 +235,7 @@ public class WorkflowExecutor {
     }
 
     /**
-     * Failure TX: step and instance {@code FAILED}. Instance {@code output_json}
+     * Step-fail transaction: step and instance {@code FAILED}. Instance {@code output_json}
      * stays null. Terminal until a retry policy exists.
      *
      * @param workflowId instance id

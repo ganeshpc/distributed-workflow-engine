@@ -10,12 +10,18 @@ import jakarta.persistence.Id;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.Table;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
 import org.hibernate.annotations.ColumnTransformer;
 import org.hibernate.annotations.DynamicUpdate;
 
 import java.time.Instant;
 import java.util.UUID;
 
+@Getter
+@Setter
+@NoArgsConstructor
 @Entity
 @Table(name = "workflow_step")
 @DynamicUpdate
@@ -58,92 +64,4 @@ public class WorkflowStepEntity {
 
     @Column(name = "completed_at")
     private Instant completedAt;
-
-    public UUID getId() {
-        return id;
-    }
-
-    public void setId(UUID id) {
-        this.id = id;
-    }
-
-    public WorkflowInstanceEntity getWorkflowInstance() {
-        return workflowInstance;
-    }
-
-    public void setWorkflowInstance(WorkflowInstanceEntity workflowInstance) {
-        this.workflowInstance = workflowInstance;
-    }
-
-    public String getName() {
-        return name;
-    }
-
-    public void setName(String name) {
-        this.name = name;
-    }
-
-    public int getPosition() {
-        return position;
-    }
-
-    public void setPosition(int position) {
-        this.position = position;
-    }
-
-    public StepStatus getStatus() {
-        return status;
-    }
-
-    public void setStatus(StepStatus status) {
-        this.status = status;
-    }
-
-    public int getAttempt() {
-        return attempt;
-    }
-
-    public void setAttempt(int attempt) {
-        this.attempt = attempt;
-    }
-
-    public String getInputJson() {
-        return inputJson;
-    }
-
-    public void setInputJson(String inputJson) {
-        this.inputJson = inputJson;
-    }
-
-    public String getOutputJson() {
-        return outputJson;
-    }
-
-    public void setOutputJson(String outputJson) {
-        this.outputJson = outputJson;
-    }
-
-    public String getError() {
-        return error;
-    }
-
-    public void setError(String error) {
-        this.error = error;
-    }
-
-    public Instant getStartedAt() {
-        return startedAt;
-    }
-
-    public void setStartedAt(Instant startedAt) {
-        this.startedAt = startedAt;
-    }
-
-    public Instant getCompletedAt() {
-        return completedAt;
-    }
-
-    public void setCompletedAt(Instant completedAt) {
-        this.completedAt = completedAt;
-    }
 }

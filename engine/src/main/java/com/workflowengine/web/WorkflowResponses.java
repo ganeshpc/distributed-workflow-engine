@@ -1,10 +1,10 @@
 package com.workflowengine.web;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.workflowengine.api.StepSnapshot;
 import com.workflowengine.api.WorkflowSnapshot;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
 
 import java.util.List;
 
@@ -53,7 +53,7 @@ final class WorkflowResponses {
         }
         try {
             return mapper.readTree(json);
-        } catch (JsonProcessingException ex) {
+        } catch (JacksonException ex) {
             throw new IllegalStateException("stored json is not valid", ex);
         }
     }

@@ -10,8 +10,7 @@ import com.workflowengine.persistence.WorkflowInstanceEntity;
 import com.workflowengine.persistence.WorkflowInstanceRepository;
 import com.workflowengine.persistence.WorkflowStepEntity;
 import com.workflowengine.runtime.WorkflowExecutor;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.core.task.TaskExecutor;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -22,10 +21,9 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.util.List;
 import java.util.UUID;
 
+@Slf4j
 @Service
 public class StartWorkflowService {
-
-    private static final Logger log = LoggerFactory.getLogger(StartWorkflowService.class);
 
     private final WorkflowInstanceRepository instances;
     private final WorkflowDefinitionRegistry definitions;

@@ -1,12 +1,11 @@
 package com.workflowengine.web;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.workflowengine.api.StartWorkflowCommand;
 import com.workflowengine.application.AdmissionResult;
 import com.workflowengine.application.GetWorkflowService;
 import com.workflowengine.application.InvalidStartWorkflowException;
 import com.workflowengine.application.StartWorkflowService;
+import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -14,27 +13,20 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.ObjectMapper;
 
 import java.net.URI;
 import java.util.UUID;
 
 @RestController
+@RequiredArgsConstructor
 @RequestMapping("/api/v1/workflows")
 public class WorkflowController {
 
     private final StartWorkflowService startWorkflowService;
     private final GetWorkflowService getWorkflowService;
     private final ObjectMapper objectMapper;
-
-    public WorkflowController(
-            StartWorkflowService startWorkflowService,
-            GetWorkflowService getWorkflowService,
-            ObjectMapper objectMapper
-    ) {
-        this.startWorkflowService = startWorkflowService;
-        this.getWorkflowService = getWorkflowService;
-        this.objectMapper = objectMapper;
-    }
 
     @PostMapping
     public ResponseEntity<WorkflowResponse> start(@RequestBody StartWorkflowRequest request) {
@@ -62,7 +54,7 @@ public class WorkflowController {
         if (request.input() != null) {
             try {
                 inputJson = objectMapper.writeValueAsString(request.input());
-            } catch (JsonProcessingException ex) {
+            } catch (JacksonException ex) {
                 throw new InvalidStartWorkflowException("input is required");
             }
         }

@@ -1,6 +1,6 @@
 # Distributed Workflow Engine
 
-Java 21 / Maven multi-module workflow orchestrator. Phase 1 is a single Spring Boot process plus PostgreSQL.
+Java 21 / Maven multi-module workflow orchestrator. Phase 1 is a single Spring Boot 4 process plus PostgreSQL.
 
 ## Prerequisites
 

@@ -1,7 +1,7 @@
 package com.workflowengine.web;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
 import com.workflowengine.activity.stub.ActivityBlockHook;
 import com.workflowengine.activity.stub.CreateOrderActivity;
 import com.workflowengine.activity.stub.StubInvocationCounters;
@@ -9,13 +9,13 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
+import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
-import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.postgresql.PostgreSQLContainer;
 import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.containers.wait.strategy.WaitAllStrategy;
 import org.testcontainers.junit.jupiter.Container;
@@ -49,7 +49,7 @@ class WorkflowApiTest {
 
     @Container
     @ServiceConnection
-    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16")
+    static PostgreSQLContainer postgres = new PostgreSQLContainer("postgres:16")
             .waitingFor(new WaitAllStrategy()
                     .withStrategy(Wait.forLogMessage(
                             ".*database system is ready to accept connections.*\\s", 2))
@@ -85,18 +85,18 @@ class WorkflowApiTest {
 
         JsonNode tx1 = read(created);
         assertTx1Body(tx1);
-        assertThat(tx1.path("input").path("customerId").asText()).isEqualTo("cust-9");
+        assertThat(tx1.path("input").path("customerId").asString()).isEqualTo("cust-9");
         assertThat(tx1.path("input").path("amountCents").asInt()).isEqualTo(4999);
-        UUID id = UUID.fromString(tx1.path("id").asText());
+        UUID id = UUID.fromString(tx1.path("id").asString());
         assertThat(created.getResponse().getHeader("Location")).isEqualTo("/api/v1/workflows/" + id);
 
         JsonNode done = pollUntilTerminal(id);
-        assertThat(done.path("status").asText()).isEqualTo("COMPLETED");
+        assertThat(done.path("status").asString()).isEqualTo("COMPLETED");
         assertThat(done.path("version").asInt()).isEqualTo(10);
         assertThat(done.path("definitionVersion").asInt()).isEqualTo(1);
-        assertThat(done.path("currentStep").asText()).isEqualTo("SEND_NOTIFICATION");
+        assertThat(done.path("currentStep").asString()).isEqualTo("SEND_NOTIFICATION");
         assertThat(done.path("output")).isEqualTo(done.path("steps").get(4).path("output"));
-        assertThat(done.path("output").path("activity").asText()).isEqualTo("SEND_NOTIFICATION");
+        assertThat(done.path("output").path("activity").asString()).isEqualTo("SEND_NOTIFICATION");
         assertCompletedSteps(done);
     }
 
@@ -113,7 +113,7 @@ class WorkflowApiTest {
 
         JsonNode tx1 = read(created);
         assertTx1Body(tx1);
-        UUID id = UUID.fromString(tx1.path("id").asText());
+        UUID id = UUID.fromString(tx1.path("id").asString());
 
         assertThat(ActivityBlockHook.awaitBlocked(CreateOrderActivity.NAME, Duration.ofSeconds(5))).isTrue();
         assertThat(CreateOrderActivity.invocationCount()).isEqualTo(1);
@@ -126,7 +126,7 @@ class WorkflowApiTest {
 
         ActivityBlockHook.release(CreateOrderActivity.NAME);
         JsonNode done = pollUntilTerminal(id);
-        assertThat(done.path("status").asText()).isEqualTo("COMPLETED");
+        assertThat(done.path("status").asString()).isEqualTo("COMPLETED");
         assertThat(done.path("version").asInt()).isEqualTo(10);
     }
 
@@ -175,7 +175,7 @@ class WorkflowApiTest {
         mockMvc.perform(post("/api/v1/workflows")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(oversized))
-                .andExpect(status().isPayloadTooLarge())
+                .andExpect(status().isContentTooLarge())
                 .andExpect(jsonPath("$.error").value("Payload Too Large"));
     }
 
@@ -189,10 +189,10 @@ class WorkflowApiTest {
                         .content(body))
                 .andExpect(status().isCreated())
                 .andReturn();
-        UUID id = UUID.fromString(read(created).path("id").asText());
+        UUID id = UUID.fromString(read(created).path("id").asString());
 
         JsonNode done = pollUntilTerminal(id);
-        assertThat(done.path("status").asText()).isEqualTo("COMPLETED");
+        assertThat(done.path("status").asString()).isEqualTo("COMPLETED");
         int createCount = CreateOrderActivity.invocationCount();
         assertThat(createCount).isEqualTo(1);
 
@@ -215,26 +215,26 @@ class WorkflowApiTest {
                         .content(orderBody(key, "{\"customerId\":\"cust-9\",\"failAt\":\"PROCESS_PAYMENT\"}")))
                 .andExpect(status().isCreated())
                 .andReturn();
-        UUID id = UUID.fromString(read(created).path("id").asText());
+        UUID id = UUID.fromString(read(created).path("id").asString());
 
         JsonNode done = pollUntilTerminal(id);
-        assertThat(done.path("status").asText()).isEqualTo("FAILED");
-        assertThat(done.path("currentStep").asText()).isEqualTo("PROCESS_PAYMENT");
+        assertThat(done.path("status").asString()).isEqualTo("FAILED");
+        assertThat(done.path("currentStep").asString()).isEqualTo("PROCESS_PAYMENT");
         assertThat(done.path("version").asInt()).isEqualTo(6);
         assertThat(done.path("output").isNull()).isTrue();
-        assertThat(done.path("error").asText()).isEqualTo("STUB_FORCED_FAILURE");
+        assertThat(done.path("error").asString()).isEqualTo("STUB_FORCED_FAILURE");
 
         JsonNode steps = done.path("steps");
-        assertThat(steps.get(0).path("status").asText()).isEqualTo("COMPLETED");
-        assertThat(steps.get(1).path("status").asText()).isEqualTo("COMPLETED");
-        assertThat(steps.get(2).path("name").asText()).isEqualTo("PROCESS_PAYMENT");
-        assertThat(steps.get(2).path("status").asText()).isEqualTo("FAILED");
+        assertThat(steps.get(0).path("status").asString()).isEqualTo("COMPLETED");
+        assertThat(steps.get(1).path("status").asString()).isEqualTo("COMPLETED");
+        assertThat(steps.get(2).path("name").asString()).isEqualTo("PROCESS_PAYMENT");
+        assertThat(steps.get(2).path("status").asString()).isEqualTo("FAILED");
         assertThat(steps.get(2).path("completedAt").isNull()).isFalse();
-        assertThat(steps.get(3).path("name").asText()).isEqualTo("CREATE_SHIPMENT");
-        assertThat(steps.get(3).path("status").asText()).isEqualTo("PENDING");
+        assertThat(steps.get(3).path("name").asString()).isEqualTo("CREATE_SHIPMENT");
+        assertThat(steps.get(3).path("status").asString()).isEqualTo("PENDING");
         assertThat(steps.get(3).path("startedAt").isNull()).isTrue();
-        assertThat(steps.get(4).path("name").asText()).isEqualTo("SEND_NOTIFICATION");
-        assertThat(steps.get(4).path("status").asText()).isEqualTo("PENDING");
+        assertThat(steps.get(4).path("name").asString()).isEqualTo("SEND_NOTIFICATION");
+        assertThat(steps.get(4).path("status").asString()).isEqualTo("PENDING");
         assertThat(steps.get(4).path("startedAt").isNull()).isTrue();
     }
 
@@ -246,18 +246,18 @@ class WorkflowApiTest {
                         .content(orderBody(key, "{\"failAt\":\"CREATE_ORDER\"}")))
                 .andExpect(status().isCreated())
                 .andReturn();
-        UUID id = UUID.fromString(read(created).path("id").asText());
+        UUID id = UUID.fromString(read(created).path("id").asString());
 
         JsonNode done = pollUntilTerminal(id);
-        assertThat(done.path("status").asText()).isEqualTo("FAILED");
-        assertThat(done.path("currentStep").asText()).isEqualTo("CREATE_ORDER");
+        assertThat(done.path("status").asString()).isEqualTo("FAILED");
+        assertThat(done.path("currentStep").asString()).isEqualTo("CREATE_ORDER");
         assertThat(done.path("version").asInt()).isEqualTo(2);
 
         JsonNode steps = done.path("steps");
-        assertThat(steps.get(0).path("status").asText()).isEqualTo("FAILED");
+        assertThat(steps.get(0).path("status").asString()).isEqualTo("FAILED");
         assertThat(steps.get(0).path("completedAt").isNull()).isFalse();
         for (int i = 1; i < 5; i++) {
-            assertThat(steps.get(i).path("status").asText()).isEqualTo("PENDING");
+            assertThat(steps.get(i).path("status").asString()).isEqualTo("PENDING");
             assertThat(steps.get(i).path("startedAt").isNull()).isTrue();
             assertThat(steps.get(i).path("attempt").asInt()).isZero();
         }
@@ -271,10 +271,10 @@ class WorkflowApiTest {
                         .content(orderBody(key, "{\"failAt\":\"NOT_A_REAL_STEP\"}")))
                 .andExpect(status().isCreated())
                 .andReturn();
-        UUID id = UUID.fromString(read(created).path("id").asText());
+        UUID id = UUID.fromString(read(created).path("id").asString());
 
         JsonNode done = pollUntilTerminal(id);
-        assertThat(done.path("status").asText()).isEqualTo("COMPLETED");
+        assertThat(done.path("status").asString()).isEqualTo("COMPLETED");
         assertThat(done.path("version").asInt()).isEqualTo(10);
         assertCompletedSteps(done);
     }
@@ -296,7 +296,7 @@ class WorkflowApiTest {
                     .andExpect(status().isOk())
                     .andReturn();
             latest = read(result);
-            String status = latest.path("status").asText();
+            String status = latest.path("status").asString();
             if ("COMPLETED".equals(status) || "FAILED".equals(status)) {
                 return latest;
             }
@@ -306,21 +306,21 @@ class WorkflowApiTest {
     }
 
     private static void assertTx1Body(JsonNode body) {
-        assertThat(body.path("status").asText()).isEqualTo("PENDING");
+        assertThat(body.path("status").asString()).isEqualTo("PENDING");
         assertThat(body.path("version").asInt()).isZero();
         assertThat(body.path("currentStep").isNull()).isTrue();
         assertThat(body.path("output").isNull()).isTrue();
         assertThat(body.path("definitionVersion").asInt()).isEqualTo(1);
-        assertThat(body.path("type").asText()).isEqualTo("ORDER");
+        assertThat(body.path("type").asString()).isEqualTo("ORDER");
         assertThat(body.path("createdAt").isNull()).isFalse();
         assertThat(body.path("updatedAt").isNull()).isFalse();
         JsonNode steps = body.path("steps");
         assertThat(steps.size()).isEqualTo(5);
         for (int i = 0; i < ORDER_STEPS.size(); i++) {
             JsonNode step = steps.get(i);
-            assertThat(step.path("name").asText()).isEqualTo(ORDER_STEPS.get(i));
+            assertThat(step.path("name").asString()).isEqualTo(ORDER_STEPS.get(i));
             assertThat(step.path("position").asInt()).isEqualTo(i);
-            assertThat(step.path("status").asText()).isEqualTo("PENDING");
+            assertThat(step.path("status").asString()).isEqualTo("PENDING");
             assertThat(step.path("attempt").asInt()).isZero();
             assertThat(step.path("output").isNull()).isTrue();
             assertThat(step.path("startedAt").isNull()).isTrue();
@@ -333,13 +333,13 @@ class WorkflowApiTest {
         assertThat(steps.size()).isEqualTo(5);
         for (int i = 0; i < ORDER_STEPS.size(); i++) {
             JsonNode step = steps.get(i);
-            assertThat(step.path("name").asText()).isEqualTo(ORDER_STEPS.get(i));
+            assertThat(step.path("name").asString()).isEqualTo(ORDER_STEPS.get(i));
             assertThat(step.path("position").asInt()).isEqualTo(i);
-            assertThat(step.path("status").asText()).isEqualTo("COMPLETED");
+            assertThat(step.path("status").asString()).isEqualTo("COMPLETED");
             assertThat(step.path("attempt").asInt()).isEqualTo(1);
             assertThat(step.path("startedAt").isNull()).isFalse();
             assertThat(step.path("completedAt").isNull()).isFalse();
-            assertThat(step.path("output").path("activity").asText()).isEqualTo(ORDER_STEPS.get(i));
+            assertThat(step.path("output").path("activity").asString()).isEqualTo(ORDER_STEPS.get(i));
         }
     }
 

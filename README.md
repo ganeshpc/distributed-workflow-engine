@@ -4,7 +4,7 @@ A Java 21 / Spring Boot 4.1 workflow **orchestrator**. It coordinates a linear e
 
 This is **not** Temporal. There is no event-sourced history, no deterministic replay of workflow code, and no task-queue matching. The engine stores *where the saga is now* (`PENDING` / `RUNNING` / `COMPLETED` / `FAILED`) and commits each transition before it calls the next activity.
 
-**Current stage: Phase 2.** One Spring Boot process plus Postgres. Activities are in-process stubs (canned JSON, no real orders or payments). After a crash, a scanner resumes never-started admissions and leftover `RUNNING` steps. `FAILED` is not retried. Kafka, worker processes, timeouts, and compensation are later phases.
+**Current stage: Phase 2.** One Spring Boot process plus Postgres. Activities are in-process stubs (canned JSON, no real orders or payments). After a crash, a scanner resumes never-started admissions and leftover `RUNNING` steps. `FAILED` is not retried. How this maps to Kafka, workers, idempotency, and compensation is in [Current code vs the end goal](#current-code-vs-the-end-goal).
 
 The design contract is [`docs/architecture.md`](docs/architecture.md). Agent rules are in [`AGENTS.md`](AGENTS.md).
 
@@ -22,10 +22,11 @@ The design contract is [`docs/architecture.md`](docs/architecture.md). Agent rul
 8. [Happy-path state table](#happy-path-state-table)
 9. [Scenarios](#scenarios)
 10. [What changed in Phase 2](#what-changed-in-phase-2)
-11. [HTTP contract](#http-contract)
-12. [Configuration](#configuration)
-13. [Tests](#tests)
-14. [Roadmap](#roadmap)
+11. [Current code vs the end goal](#current-code-vs-the-end-goal)
+12. [HTTP contract](#http-contract)
+13. [Configuration](#configuration)
+14. [Tests](#tests)
+15. [Roadmap](#roadmap)
 
 ---
 
@@ -384,6 +385,93 @@ Phase 1 left leftovers stuck on purpose: restart did **not** resume, and idempot
 **New types:** `RetryPolicy`, `WorkflowDispatcher`, `RecoveryScanner`. **New config:** `workflow.recovery.enabled` (default true), `workflow.recovery.interval-ms` (default 2000). **Clock** bean for due-time. Daemon `TaskScheduler` so recovery ticks do not keep the JVM alive after shutdown.
 
 **Unchanged on purpose:** REST paths, admit snapshot (`201` still `PENDING`/`version=0`), no Kafka, no worker module, no compensation, no timeout poller, stubs still canned JSON.
+
+---
+
+## Current code vs the end goal
+
+The **end goal** is still this product: a **durable current-state orchestrator** (Conductor / Step Functions / saga shape), not a Temporal clone. History replay, deterministic workflow-as-code, query handlers, and multi-language SDKs stay **theoretical**. What grows is *where* work runs, *how* it is dispatched, and *how* crashes and failures are handled.
+
+Postgres remains the source of truth for orchestration metadata. Kafka, when it appears, is **transport only**.
+
+### Topology
+
+| Concern | Now (Phase 2) | End goal (planned) |
+|---|---|---|
+| Processes | One JVM: REST + executor + stubs + scanner | Engine JVM(s) + **one** worker JVM first (Phase 5). Optional later split into service-owned workers (Phase 8). |
+| Compose | Postgres only | Postgres + Kafka. No five microservices on day one of Kafka. |
+| Who runs activities | Engine thread pool (`workflow-*`), in-process stubs | Worker process implements `Activity` from `engine-api`. Engine never calls the card network or stock DB. |
+| Engine replicas | `replicas > 1` is a defect | Allowed only after out-of-process activities (5), idempotent activities (6), and `SKIP LOCKED` claim (9). |
+
+### How a step runs
+
+**Now:** commit-before-invoke is **synchronous in one process**.
+
+1. Commit step `RUNNING`.
+2. Same thread calls `InProcessActivityInvoker` → stub `Activity.execute`.
+3. Same thread commits `COMPLETED` or `FAILED`.
+
+**End goal (Phase 5):** commit-before-invoke becomes **dispatch-and-complete-later**.
+
+1. Engine commits step `RUNNING`.
+2. Engine publishes a task (first cut: persist-then-publish; outbox may **replace** that path).
+3. Engine thread **returns**. It does not `future.get()` on Kafka.
+4. Worker executes the activity (own DB for business data).
+5. Worker publishes a result keyed by `(workflowId, step, attempt)`.
+6. Engine result consumer applies the mid-step complete, workflow-complete, or step-fail transaction.
+
+`ActivityInvoker` as a blocking in-process port is a Phase 1/2 seam. Phase 5 rewrites the executor; it does not “implement Kafka by blocking.”
+
+### Recovery
+
+| Now | End goal |
+|---|---|
+| `RecoveryScanner` finds `PENDING` / `RUNNING` in Postgres and calls `WorkflowDispatcher.submit` → in-process `WorkflowExecutor.run` | Same leftover rows. Scanner **republishes** stale `RUNNING` tasks to Kafka instead of invoking locally. Lost messages are recovered from committed `RUNNING`, not from Kafka as SoT. |
+| Inflight set is in-memory (one process) | Multi-instance engines claim rows with `SELECT … FOR UPDATE SKIP LOCKED` (Phase 9). `@Version` rejects stale writers. |
+| `FAILED` is never retried | Retry policy on `FAILED` can be turned on once backoff/`next_attempt_at` are used for that path. Timeouts become `FAILED` or a later `TIMED_OUT` (Phase 3). |
+
+### Time, failure, and side effects
+
+| Concern | Now | End goal |
+|---|---|---|
+| Time | No step timeout. Backoff field exists (`next_attempt_at`) but ORDER uses zero delay. | Phase 3: poller marks overdue `RUNNING` failed-by-timeout (rows + clock, not `Thread.sleep`). Phase 10: first-class timer *steps*. |
+| Activity failure | Stub `failAt` or `success=false` → step-fail; instance `FAILED`; later steps stay `PENDING`. | Same forward fail, then **compensation** (Phase 7): reverse walk of completed steps, states `COMPENSATING` / `COMPENSATED`. Requires Phase 6. |
+| Double invoke after crash | Real: stub runs twice. Documented. Stubs have no money/stock. | Phase 6: worker idempotency store “this attempt already completed.” Effectively-once = at-least-once delivery + idempotent handler. **Hard gate** before real payment/inventory. |
+| `failAt` | Stubs honor it always. | Workers ignore `failAt` unless `spring.profiles.active=test`. |
+
+### API and definitions
+
+| Now | End goal |
+|---|---|
+| `POST` / `GET` one workflow. No list, cancel, signal, `?wait=`. | Same admit-then-run. Later: signals `POST /workflows/{id}/signals/{name}`, maybe list/cancel. Still no Temporal query handlers. |
+| Linear `ORDER` in Java (`OrderWorkflowDefinition`). | Still Java definitions unless a later phase chooses otherwise. Branching, parallel+join, timer steps (Phase 10). Not BPMN, not a designer. |
+| JSON as `String` in `engine-api`; Jackson only at HTTP. | Unchanged contract so workers never depend on `engine`. |
+
+### Data that stays vs data that appears later
+
+**Stays:** `workflow_instance` / `workflow_step` as current state. `@Version`. `definition_version`. `attempt`. `idx_workflow_instance_status`.
+
+**Already added for later use:** `next_attempt_at`, `RetryPolicy` on `StepDefinition`.
+
+**Planned tables/states, not present now:** `workflow_event` (audit/UI), outbox (if persist-then-publish drops publishes), `COMPENSATING` / `COMPENSATED` / `CANCELED` / `TIMED_OUT`, worker-side idempotency keys.
+
+### Picture
+
+```
+Now (Phase 2)
+  Client → Engine HTTP → admit commit → workflow-* thread → stub.execute → complete/fail commit
+                         ↘ crash leftover → RecoveryScanner → same thread pool → stub.execute again
+
+End goal (Phase 5–9, still current-state)
+  Client → Engine HTTP → admit commit
+       → Engine: RUNNING commit → Kafka task
+       → Worker: Activity.execute (idempotent from Phase 6)
+       → Kafka result → Engine: complete/fail commit
+       → crash leftover → scanner republishes RUNNING to Kafka (not in-process invoke)
+       → N engines: SKIP LOCKED claim; workers scaled independently
+```
+
+If a sentence in this README and [`docs/architecture.md`](docs/architecture.md) disagree, the architecture doc wins.
 
 ---
 

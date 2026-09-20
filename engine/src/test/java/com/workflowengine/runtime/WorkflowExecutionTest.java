@@ -39,6 +39,12 @@ import java.util.concurrent.TimeUnit;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+/**
+ * State-machine tests without HTTP: happy path {@code version == 10},
+ * {@code failAt}, concurrent admit, unknown type, and blocked-stub TX1.
+ *
+ * <p>Uses Testcontainers Postgres. Does not mock the database.
+ */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE)
 @Testcontainers
 class WorkflowExecutionTest {

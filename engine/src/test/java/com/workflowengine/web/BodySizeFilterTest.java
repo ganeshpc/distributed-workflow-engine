@@ -10,6 +10,11 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+/**
+ * Unit tests for the 64 KB {@link BodySizeFilter} without Spring or Postgres.
+ *
+ * <p>Covers Content-Length 413, missing-length abort, and the JSON error body.
+ */
 class BodySizeFilterTest {
 
     private final BodySizeFilter filter = new BodySizeFilter();

@@ -21,6 +21,31 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.util.List;
 import java.util.UUID;
 
+/**
+ * Persists a new ORDER instance and submits in-process execution after commit.
+ *
+ * <p>This is the Phase 1 admission service: it is the only writer that creates
+ * rows, and the only place that may submit {@link WorkflowExecutor}. HTTP
+ * adapters in {@code com.workflowengine.web} call this type; they do not talk
+ * to the executor or repositories directly.
+ *
+ * <p><strong>Admit-then-run</strong> and <strong>idempotent admission</strong>:
+ * TX1 inserts the instance as {@code PENDING}, {@code version = 0},
+ * {@code current_step} null, and every step {@code PENDING}. The returned
+ * snapshot is that TX1 aggregate. Callers must not reload it after submit.
+ * Concurrent posts with the same key serialize on
+ * {@code uq_workflow_instance_idempotency_key}. Only the INSERT winner
+ * submits the executor. The unique-violation path returns the existing
+ * snapshot and does not submit.
+ *
+ * <p>Concurrency: many request threads may call {@link #start} at once. This
+ * type is a Spring singleton; it holds no per-request state.
+ *
+ * <p>Failure handling: validation throws {@link InvalidStartWorkflowException}
+ * (HTTP 400). Unique-key conflict reloads the existing row and returns
+ * {@code created = false}. Executor-thread failures after a successful admit
+ * are not reported on this call; clients poll GET.
+ */
 @Slf4j
 @Service
 public class StartWorkflowService {
@@ -31,6 +56,16 @@ public class StartWorkflowService {
     private final TaskExecutor workflowTaskExecutor;
     private final TransactionTemplate transactionTemplate;
 
+    /**
+     * Wires admission. The transaction template is built here so TX1 is
+     * explicit and not a class-level {@code @Transactional} around invoke.
+     *
+     * @param instances instance repository
+     * @param definitions type registry
+     * @param workflowExecutor runner submitted after TX1
+     * @param workflowTaskExecutor pool that must not be the request thread
+     * @param transactionManager used only for TX1 insert
+     */
     public StartWorkflowService(
             WorkflowInstanceRepository instances,
             WorkflowDefinitionRegistry definitions,
@@ -45,6 +80,14 @@ public class StartWorkflowService {
         this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
 
+    /**
+     * Admits a workflow on the HTTP request thread.
+     *
+     * @param command validated type, key, and input JSON; must not be null
+     * @return TX1 snapshot when {@code created} is true; current snapshot otherwise
+     * @throws InvalidStartWorkflowException when type, key, or input is invalid
+     * @apiNote {@code 201} is not terminal. Poll GET.
+     */
     public AdmissionResult start(StartWorkflowCommand command) {
         WorkflowDefinition definition = validate(command);
 
@@ -70,6 +113,13 @@ public class StartWorkflowService {
         return new AdmissionResult(true, WorkflowSnapshots.from(created));
     }
 
+    /**
+     * Rejects unknown type, missing/blank/too-long key, and blank input.
+     *
+     * @param command admit command
+     * @return registered definition
+     * @throws InvalidStartWorkflowException on any validation miss
+     */
     private WorkflowDefinition validate(StartWorkflowCommand command) {
         if (command == null) {
             throw new InvalidStartWorkflowException("command is required");
@@ -89,6 +139,14 @@ public class StartWorkflowService {
         return definition;
     }
 
+    /**
+     * TX1: insert instance {@code PENDING} plus one {@code PENDING} step per
+     * definition position. Flushes so unique-key races surface here.
+     *
+     * @param command admit command
+     * @param definition graph whose version and steps are copied
+     * @return persisted aggregate still at version 0
+     */
     private WorkflowInstanceEntity insert(StartWorkflowCommand command, WorkflowDefinition definition) {
         WorkflowInstanceEntity instance = new WorkflowInstanceEntity();
         instance.setId(UUID.randomUUID());
@@ -111,6 +169,12 @@ public class StartWorkflowService {
         return instances.saveAndFlush(instance);
     }
 
+    /**
+     * Distinguishes the idempotency unique index from other integrity errors.
+     *
+     * @param ex Spring data-integrity wrapper
+     * @return true only for {@code uq_workflow_instance_idempotency_key}
+     */
     private static boolean isIdempotencyKeyViolation(DataIntegrityViolationException ex) {
         Throwable cause = ex.getMostSpecificCause();
         String message = cause.getMessage();

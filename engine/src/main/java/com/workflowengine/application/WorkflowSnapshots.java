@@ -8,11 +8,24 @@ import com.workflowengine.persistence.WorkflowStepEntity;
 import java.util.Comparator;
 import java.util.List;
 
+/**
+ * Maps JPA aggregates to {@link WorkflowSnapshot}. Steps are sorted by
+ * {@code position}. Null {@code version} is treated as 0.
+ *
+ * <p>Pure functions; no persistence. Safe to call from request or executor
+ * threads after the entity is loaded.
+ */
 public final class WorkflowSnapshots {
 
     private WorkflowSnapshots() {
     }
 
+    /**
+     * Copies instance and steps into an immutable snapshot.
+     *
+     * @param instance loaded aggregate; steps must be present
+     * @return snapshot with steps ordered by position
+     */
     public static WorkflowSnapshot from(WorkflowInstanceEntity instance) {
         List<StepSnapshot> steps = instance.getSteps().stream()
                 .sorted(Comparator.comparingInt(WorkflowStepEntity::getPosition))
@@ -36,6 +49,12 @@ public final class WorkflowSnapshots {
         );
     }
 
+    /**
+     * Copies one step. {@code input_json} is omitted from the public snapshot.
+     *
+     * @param step loaded step
+     * @return step snapshot
+     */
     private static StepSnapshot from(WorkflowStepEntity step) {
         return new StepSnapshot(
                 step.getName(),

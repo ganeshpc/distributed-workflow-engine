@@ -32,6 +32,13 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+/**
+ * Crash leftover: a blocked first stub is visible as {@code RUNNING} on a
+ * second JDBC connection, and a new Spring context against the same database
+ * must not increment the stub invocation count.
+ *
+ * <p>Inserting a {@code RUNNING} row by hand is not a substitute.
+ */
 class WorkflowDurabilityTest {
 
     private static PostgreSQLContainer postgres;

@@ -21,6 +21,10 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+/**
+ * Flyway V1 plus JPA: five steps, unique idempotency key, unique position,
+ * {@code @Version} starts at 0. No executor and no REST.
+ */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE)
 @Testcontainers
 class WorkflowPersistenceTest {

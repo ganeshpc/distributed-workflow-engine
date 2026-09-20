@@ -10,8 +10,13 @@ import java.nio.file.Path;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+/**
+ * Guards the package boundary: {@link WorkflowExecutor} must not import
+ * {@code com.workflowengine.activity.stub}.
+ */
 class WorkflowExecutorPackageTest {
 
+    /** Fails if the executor class file names the stub package. */
     @Test
     void executorBytecodeDoesNotReferenceStubPackage() throws IOException {
         try (InputStream in = WorkflowExecutor.class.getResourceAsStream("WorkflowExecutor.class")) {

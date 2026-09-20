@@ -23,10 +23,9 @@ import java.util.UUID;
  * JPA mapping of {@code workflow_step}. Order is {@code position}, unique per
  * instance together with {@code name}.
  *
- * <p>Phase 1 keeps {@code input_json} SQL {@code NULL}. {@code started_at} and
+ * <p>{@code input_json} stays SQL {@code NULL}. {@code started_at} and
  * {@code completed_at} are stamped with PostgreSQL {@code now()}. A leftover
- * {@code RUNNING} row is the crash-mid-invoke contract; Phase 1 does not
- * re-invoke it.
+ * {@code RUNNING} row is resumed by Phase 2 (attempt++); {@code FAILED} is not.
  *
  * <p>Not thread-safe. Lombok generates getters, setters, and the JPA constructor.
  */
@@ -86,4 +85,11 @@ public class WorkflowStepEntity {
     /** Database clock at complete or fail. */
     @Column(name = "completed_at")
     private Instant completedAt;
+
+    /**
+     * When a leftover {@code RUNNING} step is due for resume. Null means due
+     * now (crash leftover or zero backoff). {@code FAILED} rows ignore this.
+     */
+    @Column(name = "next_attempt_at")
+    private Instant nextAttemptAt;
 }

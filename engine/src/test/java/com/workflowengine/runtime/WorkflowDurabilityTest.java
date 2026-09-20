@@ -12,6 +12,7 @@ import com.workflowengine.application.StartWorkflowService;
 import com.workflowengine.persistence.WorkflowInstanceEntity;
 import com.workflowengine.persistence.WorkflowInstanceRepository;
 import com.workflowengine.persistence.WorkflowStepEntity;
+import com.workflowengine.support.WorkflowAwait;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -34,8 +35,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Crash leftover: a blocked first stub is visible as {@code RUNNING} on a
- * second JDBC connection, and a new Spring context against the same database
- * must not increment the stub invocation count.
+ * second JDBC connection. A new Spring context against the same database
+ * re-invokes that step (Phase 2) and increments {@code attempt}.
  *
  * <p>Inserting a {@code RUNNING} row by hand is not a substitute.
  */
@@ -66,7 +67,7 @@ class WorkflowDurabilityTest {
     }
 
     @Test
-    void committedRunningIsVisibleAndDoesNotResumeAfterRestart() throws Exception {
+    void committedRunningIsVisibleAndResumesAfterRestart() throws Exception {
         ActivityBlockHook.install(CreateOrderActivity.NAME);
         UUID workflowId;
         int invocationsAfterBlock;
@@ -92,25 +93,31 @@ class WorkflowDurabilityTest {
             first.close();
         }
 
+        ActivityBlockHook.clear();
+        ActivityBlockHook.install(CreateOrderActivity.NAME);
+
         ConfigurableApplicationContext second = startContext();
         try {
+            assertThat(ActivityBlockHook.awaitBlocked(CreateOrderActivity.NAME, Duration.ofSeconds(5)))
+                    .isTrue();
+            assertThat(CreateOrderActivity.invocationCount()).isEqualTo(invocationsAfterBlock + 1);
+
             WorkflowInstanceRepository instances = second.getBean(WorkflowInstanceRepository.class);
             WorkflowInstanceEntity reloaded = instances.findById(workflowId).orElseThrow();
             assertThat(reloaded.getStatus()).isEqualTo(WorkflowStatus.RUNNING);
-            assertThat(reloaded.getCurrentStep()).isEqualTo(CreateOrderActivity.NAME);
             WorkflowStepEntity firstStep = reloaded.getSteps().stream()
                     .filter(step -> step.getPosition() == 0)
                     .findFirst()
                     .orElseThrow();
             assertThat(firstStep.getStatus()).isEqualTo(StepStatus.RUNNING);
-            assertThat(firstStep.getAttempt()).isEqualTo(1);
+            assertThat(firstStep.getAttempt()).isEqualTo(2);
             assertThat(firstStep.getStartedAt()).isNotNull();
 
-            Thread.sleep(300);
-            assertThat(CreateOrderActivity.invocationCount()).isEqualTo(invocationsAfterBlock);
-            WorkflowInstanceEntity still = instances.findById(workflowId).orElseThrow();
-            assertThat(still.getStatus()).isEqualTo(WorkflowStatus.RUNNING);
-            assertThat(still.getVersion()).isEqualTo(reloaded.getVersion());
+            ActivityBlockHook.release(CreateOrderActivity.NAME);
+            WorkflowInstanceEntity done = WorkflowAwait.awaitTerminal(
+                    instances, workflowId, Duration.ofSeconds(5));
+            assertThat(done.getStatus()).isEqualTo(WorkflowStatus.COMPLETED);
+            assertThat(done.getSteps().getFirst().getAttempt()).isEqualTo(2);
         } finally {
             second.close();
             ActivityBlockHook.clear();

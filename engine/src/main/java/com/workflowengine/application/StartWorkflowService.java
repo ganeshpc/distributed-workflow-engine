@@ -9,10 +9,8 @@ import com.workflowengine.domain.WorkflowDefinitionRegistry;
 import com.workflowengine.persistence.WorkflowInstanceEntity;
 import com.workflowengine.persistence.WorkflowInstanceRepository;
 import com.workflowengine.persistence.WorkflowStepEntity;
-import com.workflowengine.runtime.WorkflowExecutor;
+import com.workflowengine.runtime.WorkflowDispatcher;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.core.task.TaskExecutor;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -25,7 +23,7 @@ import java.util.UUID;
  * Persists a new ORDER instance and submits in-process execution after commit.
  *
  * <p>This is the Phase 1 admission service: it is the only writer that creates
- * rows, and the only place that may submit {@link WorkflowExecutor}. HTTP
+ * rows. It submits via {@link WorkflowDispatcher} only for the INSERT winner. HTTP
  * adapters in {@code com.workflowengine.web} call this type; they do not talk
  * to the executor or repositories directly.
  *
@@ -52,8 +50,7 @@ public class StartWorkflowService {
 
     private final WorkflowInstanceRepository instances;
     private final WorkflowDefinitionRegistry definitions;
-    private final WorkflowExecutor workflowExecutor;
-    private final TaskExecutor workflowTaskExecutor;
+    private final WorkflowDispatcher dispatcher;
     private final TransactionTemplate transactionTemplate;
 
     /**
@@ -62,21 +59,18 @@ public class StartWorkflowService {
      *
      * @param instances instance repository
      * @param definitions type registry
-     * @param workflowExecutor runner submitted after the admit transaction
-     * @param workflowTaskExecutor pool that must not be the request thread
+     * @param dispatcher submit-once runner after the admit transaction
      * @param transactionManager used only for admit insert
      */
     public StartWorkflowService(
             WorkflowInstanceRepository instances,
             WorkflowDefinitionRegistry definitions,
-            WorkflowExecutor workflowExecutor,
-            @Qualifier("workflowTaskExecutor") TaskExecutor workflowTaskExecutor,
+            WorkflowDispatcher dispatcher,
             PlatformTransactionManager transactionManager
     ) {
         this.instances = instances;
         this.definitions = definitions;
-        this.workflowExecutor = workflowExecutor;
-        this.workflowTaskExecutor = workflowTaskExecutor;
+        this.dispatcher = dispatcher;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
 
@@ -107,7 +101,7 @@ public class StartWorkflowService {
         }
 
         UUID workflowId = created.getId();
-        workflowTaskExecutor.execute(() -> workflowExecutor.run(workflowId));
+        dispatcher.submit(workflowId);
         log.info("workflow admitted workflowId={} type={} status=PENDING version=0",
                 workflowId, created.getType());
         return new AdmissionResult(true, WorkflowSnapshots.from(created));

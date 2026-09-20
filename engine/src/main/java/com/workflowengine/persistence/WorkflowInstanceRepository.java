@@ -3,6 +3,10 @@ package com.workflowengine.persistence;
 import org.springframework.data.jpa.repository.EntityGraph;
 import org.springframework.data.jpa.repository.JpaRepository;
 
+import com.workflowengine.api.WorkflowStatus;
+
+import java.util.Collection;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -33,4 +37,14 @@ public interface WorkflowInstanceRepository extends JpaRepository<WorkflowInstan
      */
     @EntityGraph(attributePaths = "steps")
     Optional<WorkflowInstanceEntity> findByIdempotencyKey(String idempotencyKey);
+
+    /**
+     * Phase 2 leftover scan. Uses {@code idx_workflow_instance_status}.
+     * Callers must ignore {@code FAILED} / {@code COMPLETED} even if passed in.
+     *
+     * @param statuses typically {@code PENDING} and {@code RUNNING}
+     * @return aggregates with steps loaded
+     */
+    @EntityGraph(attributePaths = "steps")
+    List<WorkflowInstanceEntity> findByStatusIn(Collection<WorkflowStatus> statuses);
 }

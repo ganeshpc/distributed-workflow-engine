@@ -17,3 +17,8 @@ management:
     web:
       exposure:
         include: health
+
+workflow:
+  recovery:
+    enabled: true
+    interval-ms: 2000

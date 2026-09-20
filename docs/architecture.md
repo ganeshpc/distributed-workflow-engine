@@ -120,7 +120,8 @@ These are decided. They are not open questions. Phase 1 implementation forks tha
 | Execution model (Phase 1) | **Admit-then-run.** The admit transaction commits instance+steps. `POST` returns `201` + `Location` + id. An in-process executor thread then runs the saga. Still one JVM, no Kafka. | Sync-to-terminal was convenient and lost the only handle on crash-during-POST. GET is how tests wait for `COMPLETED`. |
 | Wait-for-terminal on POST | **Not** in the Phase 1 API | A `?wait=true` flag would ossify "POST is complete" and is unnecessary once the id is in the `201`. Curl uses `POST` then `GET`. |
 | Units of work | **Commit-before-invoke.** Activity `execute` is never inside an open workflow transaction. See [Units of work](#units-of-work-phase-1). | A single `@Transactional` around start+run rolls back `RUNNING` on crash and falsifies the Phase 1 guarantee. |
-| Crash mid-step (Phase 1) | After a committed `RUNNING` write, invoke. On restart, leave it `RUNNING`. Do **not** auto-resume. Do **not** start the executor on idempotent `200`. | Auto-resume without activity idempotency double-executes. Recovery is **Planned** Phase 2. |
+| Crash mid-step (Phase 1) | After a committed `RUNNING` write, invoke. On restart, leave it `RUNNING`. Do **not** auto-resume. Do **not** start the executor on idempotent `200`. | Phase 1 contract. |
+| Crash leftovers (Phase 2) | Scanner resumes never-started `PENDING` and due `RUNNING` (`attempt++`). `FAILED` is not retried. Idempotent `200` still does not submit. | At-least-once steps; stubs remain non-idempotent. |
 | Version column | Integer `version` on `workflow_instance`, mapped as JPA **`@Version` only** | Do **not** also write `version = version + 1` in custom SQL. One increment per instance-touching transaction. Happy-path terminal `version = 10` (see transition table). |
 | Step order | `workflow_step.position INT NOT NULL` + `UNIQUE (workflow_instance_id, position)` | Names are not an order. `ORDER BY started_at` fails for `PENDING` tails. |
 | Inter-step I/O | Every activity receives `workflowInputJson` re-serialized from the instance `input_json` row (same JSON **value** for every step). `stepInputJson` is **null**. Engine does **not** chain `output_json`. | JSONB will not preserve request whitespace/key order. Chaining is a later product decision. |
@@ -886,13 +887,13 @@ If the first request won the INSERT, it may also have submitted the executor bef
 - A failed workflow stays failed.
 - We will **not** automatically continue or retry. Startup does not scan. Idempotent `200` does not start the executor.
 
-### Phase 1 non-guarantees / leftovers the later scanner must see
+### Leftovers the Phase 2 scanner resumes
 
 | Leftover | How it happens | Phase 1 | Phase 2 |
 |---|---|---|---|
-| Instance `PENDING`, all steps `PENDING` | Crash after admit before first step-start, submit lost, or executor-thread infra failure before first step-start | Stuck; client has id via key retry; `GET` is `200` | **Resume:** start first step |
-| Instance `RUNNING`, one step `RUNNING`, earlier `COMPLETED`, later `PENDING` | Crash during invoke after `RUNNING` commit, or executor-thread infra failure after that commit | Stuck; no second invoke; `GET` is `200` | **Resume:** re-invoke that `RUNNING` step (`attempt++`) |
-| Instance `FAILED`, some `COMPLETED`, one `FAILED`, rest `PENDING` | `failAt` or stub failure | Terminal | **Do not retry** until a retry policy exists |
+| Instance `PENDING`, all steps `PENDING` | Crash after admit before first step-start, submit lost, or executor-thread infra failure before first step-start | Stuck in Phase 1 | **Resume:** start first step |
+| Instance `RUNNING`, one step `RUNNING`, earlier `COMPLETED`, later `PENDING` | Crash during invoke after `RUNNING` commit, or executor-thread infra failure after that commit | Stuck in Phase 1 | **Resume:** re-invoke that `RUNNING` step (`attempt++`) |
+| Instance `FAILED`, some `COMPLETED`, one `FAILED`, rest `PENDING` | `failAt` or stub failure | Terminal | **Do not retry** (policy exists for `RUNNING` leftovers only) |
 | Instance `RUNNING`, all steps `COMPLETED` | Must **not** occur if workflow-complete is one transaction | Not an expected leftover | N/A if Phase 1 holds the one-transaction rule |
 
 We do **not** list "client may never learn the id" as a remaining hole: the key is required and retry is specified.
@@ -1047,7 +1048,7 @@ Admit-then-run, in-process stubs, REST start/get, Postgres, Flyway, Testcontaine
 
 Concepts: state machine, SoT, committed visibility, idempotent admission, optimistic lock, orchestration.
 
-### Phase 2 — Crash recovery + retry with backoff (**Planned**)
+### Phase 2 — Crash recovery + retry with backoff (**implemented**, PR-05)
 
 **Scan target (one sentence):** resume committed `RUNNING` steps, and `PENDING` instances that never started (no step has left `PENDING`); do **not** retry terminal `FAILED` until a retry policy exists.
 

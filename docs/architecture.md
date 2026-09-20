@@ -113,9 +113,10 @@ These are decided. They are not open questions. Phase 1 implementation forks tha
 | Identity | Server-generated workflow UUID | Primary key is not a client-owned business id. |
 | Idempotency key | **Required** on Phase 1 `POST` (`1..128` chars) | Crash during `POST` after admission must still have a client-visible handle. Retry is `POST` with the same key. Optional keys + no list API = leaked rows with no name. Optional keys are **Planned** once a list or lookup-by-key exists. |
 | Maven coordinates | `groupId`: `com.workflowengine` | Readable, not trademark-adjacent. Artifact names in English. No Temporal type names that imply wire compatibility. |
-| Parent POM | Aggregator `pom` imports `spring-boot-dependencies` **3.5.x BOM**. It does **not** use `spring-boot-starter-parent`. `engine` applies `spring-boot-maven-plugin`. | `engine-api` must stay a plain jar. Starter-parent on the root would push Boot plugin/config onto the API module. |
+| Parent POM | Aggregator `pom` imports `spring-boot-dependencies` **4.1.x BOM**. It does **not** use `spring-boot-starter-parent`. `engine` applies `spring-boot-maven-plugin`. | `engine-api` must stay a plain jar. Starter-parent on the root would push Boot plugin/config onto the API module. |
 | Module layout | Parent + `engine-api` + `engine` only | `engine-api` is the shared contract (statuses, snapshots, `Activity*`). Empty `workers-*` modules are refused. |
-| `engine-api` dependencies | JDK only. No Spring, JPA, Kafka, Jackson. JSON travels as `String` (UTF-8 JSON text). | Workers must depend on contracts, not the Boot app and not a JSON library we picked for them. |
+| `engine-api` dependencies | JDK only. No Spring, JPA, Kafka, Jackson, Lombok. JSON travels as `String` (UTF-8 JSON text). | Workers must depend on contracts, not the Boot app and not a JSON library we picked for them. |
+| Lombok | **`engine` only.** `@Getter`/`@Setter`/`@NoArgsConstructor` on JPA entities; `@Slf4j`; `@RequiredArgsConstructor` for simple injection. Never `@Data` / `@EqualsAndHashCode` on entities. | Cuts boilerplate in the Boot module. `engine-api` stays a plain JDK jar so workers do not inherit an annotation processor. |
 | Execution model (Phase 1) | **Admit-then-run.** TX1 commits instance+steps. `POST` returns `201` + `Location` + id. An in-process executor thread then runs the saga. Still one JVM, no Kafka. | Sync-to-terminal was convenient and lost the only handle on crash-during-POST. GET is how tests wait for `COMPLETED`. |
 | Wait-for-terminal on POST | **Not** in the Phase 1 API | A `?wait=true` flag would ossify "POST is complete" and is unnecessary once the id is in the `201`. Curl uses `POST` then `GET`. |
 | Units of work | **Commit-before-invoke.** Activity `execute` is never inside an open workflow transaction. See [Units of work](#units-of-work-phase-1). | A single `@Transactional` around start+run rolls back `RUNNING` on crash and falsifies the Phase 1 guarantee. |
@@ -446,7 +447,7 @@ com.workflowengine.api
 
 ```
 distributed-workflow-engine/
-  pom.xml                      aggregator; imports spring-boot-dependencies 3.5.x BOM
+  pom.xml                      aggregator; imports spring-boot-dependencies 4.1.x BOM
   engine-api/                  JDK-only contracts
     pom.xml
     src/main/java/com/workflowengine/api/...
@@ -470,7 +471,7 @@ Parent coordinates:
 - `packaging`: `pom`
 - modules: `engine-api`, `engine`
 - Java 21
-- `dependencyManagement`: import `org.springframework.boot:spring-boot-dependencies:3.5.x` (BOM)
+- `dependencyManagement`: import `org.springframework.boot:spring-boot-dependencies:4.1.x` (BOM)
 - JUnit 5, Testcontainers PostgreSQL managed via that BOM / Testcontainers BOM as needed
 
 `engine-api` allowed dependencies: **none** beyond the JDK. No Spring, JPA, Kafka, Jackson, Lombok.

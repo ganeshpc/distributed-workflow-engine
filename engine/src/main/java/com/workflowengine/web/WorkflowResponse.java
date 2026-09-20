@@ -1,6 +1,6 @@
 package com.workflowengine.web;
 
-import com.fasterxml.jackson.databind.JsonNode;
+import tools.jackson.databind.JsonNode;
 import com.workflowengine.api.WorkflowStatus;
 
 import java.time.Instant;

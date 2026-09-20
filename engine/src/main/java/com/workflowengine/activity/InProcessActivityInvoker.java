@@ -3,16 +3,14 @@ package com.workflowengine.activity;
 import com.workflowengine.api.activity.Activity;
 import com.workflowengine.api.activity.ActivityContext;
 import com.workflowengine.api.activity.ActivityResult;
+import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 
 @Component
+@RequiredArgsConstructor
 public class InProcessActivityInvoker implements ActivityInvoker {
 
     private final ActivityRegistry registry;
-
-    public InProcessActivityInvoker(ActivityRegistry registry) {
-        this.registry = registry;
-    }
 
     @Override
     public ActivityResult invoke(ActivityContext context) {

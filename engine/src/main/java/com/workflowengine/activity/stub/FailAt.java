@@ -1,11 +1,11 @@
 package com.workflowengine.activity.stub;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.json.JsonMapper;
 
 final class FailAt {
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final JsonMapper MAPPER = JsonMapper.builder().build();
 
     private FailAt() {
     }
@@ -17,7 +17,7 @@ final class FailAt {
         try {
             JsonNode node = MAPPER.readTree(workflowInputJson);
             JsonNode failAt = node.get("failAt");
-            return failAt != null && !failAt.isNull() && activityName.equals(failAt.asText());
+            return failAt != null && !failAt.isNull() && activityName.equals(failAt.asString());
         } catch (Exception ignored) {
             return workflowInputJson.contains("\"failAt\":\"" + activityName + "\"");
         }

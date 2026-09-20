@@ -19,7 +19,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
-import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.postgresql.PostgreSQLContainer;
 import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.containers.wait.strategy.WaitAllStrategy;
 
@@ -34,11 +34,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class WorkflowDurabilityTest {
 
-    private static PostgreSQLContainer<?> postgres;
+    private static PostgreSQLContainer postgres;
 
     @BeforeAll
     static void startPostgres() {
-        postgres = new PostgreSQLContainer<>("postgres:16")
+        postgres = new PostgreSQLContainer("postgres:16")
                 .waitingFor(new WaitAllStrategy()
                         .withStrategy(Wait.forLogMessage(
                                 ".*database system is ready to accept connections.*\\s", 2))

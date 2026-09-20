@@ -13,8 +13,7 @@ import com.workflowengine.persistence.WorkflowInstanceRepository;
 import com.workflowengine.persistence.WorkflowStepEntity;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.LockModeType;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -22,10 +21,9 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.util.List;
 import java.util.UUID;
 
+@Slf4j
 @Component
 public class WorkflowExecutor {
-
-    private static final Logger log = LoggerFactory.getLogger(WorkflowExecutor.class);
 
     private final WorkflowInstanceRepository instances;
     private final WorkflowDefinitionRegistry definitions;

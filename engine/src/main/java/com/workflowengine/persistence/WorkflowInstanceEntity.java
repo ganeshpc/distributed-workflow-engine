@@ -11,6 +11,10 @@ import jakarta.persistence.OneToMany;
 import jakarta.persistence.OrderBy;
 import jakarta.persistence.Table;
 import jakarta.persistence.Version;
+import lombok.AccessLevel;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
 import org.hibernate.annotations.ColumnTransformer;
 import org.hibernate.annotations.Generated;
 import org.hibernate.generator.EventType;
@@ -20,6 +24,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
+@Getter
+@Setter
+@NoArgsConstructor
 @Entity
 @Table(name = "workflow_instance")
 public class WorkflowInstanceEntity {
@@ -59,10 +66,12 @@ public class WorkflowInstanceEntity {
     @Column(name = "error", columnDefinition = "text")
     private String error;
 
+    @Setter(AccessLevel.NONE)
     @Generated(event = EventType.INSERT)
     @Column(name = "created_at", nullable = false, insertable = false, updatable = false)
     private Instant createdAt;
 
+    @Setter(AccessLevel.NONE)
     @Generated(event = {EventType.INSERT, EventType.UPDATE})
     @Column(name = "updated_at", nullable = false, insertable = false, updatable = false)
     private Instant updatedAt;
@@ -74,101 +83,5 @@ public class WorkflowInstanceEntity {
     public void addStep(WorkflowStepEntity step) {
         steps.add(step);
         step.setWorkflowInstance(this);
-    }
-
-    public UUID getId() {
-        return id;
-    }
-
-    public void setId(UUID id) {
-        this.id = id;
-    }
-
-    public String getType() {
-        return type;
-    }
-
-    public void setType(String type) {
-        this.type = type;
-    }
-
-    public int getDefinitionVersion() {
-        return definitionVersion;
-    }
-
-    public void setDefinitionVersion(int definitionVersion) {
-        this.definitionVersion = definitionVersion;
-    }
-
-    public WorkflowStatus getStatus() {
-        return status;
-    }
-
-    public void setStatus(WorkflowStatus status) {
-        this.status = status;
-    }
-
-    public String getInputJson() {
-        return inputJson;
-    }
-
-    public void setInputJson(String inputJson) {
-        this.inputJson = inputJson;
-    }
-
-    public String getOutputJson() {
-        return outputJson;
-    }
-
-    public void setOutputJson(String outputJson) {
-        this.outputJson = outputJson;
-    }
-
-    public String getCurrentStep() {
-        return currentStep;
-    }
-
-    public void setCurrentStep(String currentStep) {
-        this.currentStep = currentStep;
-    }
-
-    public String getIdempotencyKey() {
-        return idempotencyKey;
-    }
-
-    public void setIdempotencyKey(String idempotencyKey) {
-        this.idempotencyKey = idempotencyKey;
-    }
-
-    public Integer getVersion() {
-        return version;
-    }
-
-    public void setVersion(Integer version) {
-        this.version = version;
-    }
-
-    public String getError() {
-        return error;
-    }
-
-    public void setError(String error) {
-        this.error = error;
-    }
-
-    public Instant getCreatedAt() {
-        return createdAt;
-    }
-
-    public Instant getUpdatedAt() {
-        return updatedAt;
-    }
-
-    public List<WorkflowStepEntity> getSteps() {
-        return steps;
-    }
-
-    public void setSteps(List<WorkflowStepEntity> steps) {
-        this.steps = steps;
     }
 }

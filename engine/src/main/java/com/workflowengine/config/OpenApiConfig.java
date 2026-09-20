@@ -6,11 +6,11 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 /**
- * Interactive OpenAPI / Swagger UI for the Phase 1 HTTP surface.
+ * OpenAPI spec and Scalar UI for the HTTP surface.
  *
- * <p>UI is at {@code /swagger-ui.html} (redirects to {@code /swagger-ui/index.html}).
- * Spec is at {@code /v3/api-docs}. Localhost only; no auth. Try-it-out calls
- * the live engine on this process.
+ * <p>Scalar (cleaner than Swagger UI) is at {@code /scalar}. Spec is at
+ * {@code /v3/api-docs}. Localhost only; no auth. Try-it-out calls the live
+ * engine on this process.
  *
  * <p>Spring singleton. Does not change admit-then-run or the scanner.
  */
@@ -18,7 +18,7 @@ import org.springframework.context.annotation.Configuration;
 public class OpenApiConfig {
 
     /**
-     * API title and description shown in Swagger UI.
+     * API title and description shown in Scalar.
      *
      * @return OpenAPI info model
      */

@@ -36,7 +36,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 /**
  * HTTP Phase 1 acceptance: admit {@code 201} body, poll GET to terminal,
  * idempotent {@code 200}, {@code failAt}, 400/404/413, health-only actuator,
- * Swagger UI and OpenAPI spec.
+ * Scalar UI and OpenAPI spec.
  *
  * <p>Uses Testcontainers Postgres. Stubs are reset per test. The blocked-first
  * stub case proves the request thread does not wait for the saga.
@@ -297,8 +297,8 @@ class WorkflowApiTest {
     }
 
     @Test
-    void swaggerUiIsServed() throws Exception {
-        mockMvc.perform(get("/swagger-ui/index.html"))
+    void scalarUiIsServed() throws Exception {
+        mockMvc.perform(get("/scalar"))
                 .andExpect(status().isOk());
     }
 

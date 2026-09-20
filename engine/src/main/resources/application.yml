@@ -25,10 +25,7 @@ workflow:
 
 springdoc:
   paths-to-match: /api/**
-  swagger-ui:
-    try-it-out-enabled: true
-    operations-sorter: method
-    tags-sorter: alpha
-    display-request-duration: true
   api-docs:
     path: /v3/api-docs
+scalar:
+  path: /scalar

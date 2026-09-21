@@ -118,6 +118,7 @@ class WorkflowExecutionTest {
                 .allSatisfy(step -> {
                     assertThat(step.getStartedAt()).isNotNull();
                     assertThat(step.getCompletedAt()).isNotNull();
+                    assertThat(step.getDeadlineAt()).isNotNull();
                     assertThat(step.getInputJson()).isNull();
                     assertThat(step.getError()).isNull();
                     assertThat(step.getOutputJson()).contains(step.getName());

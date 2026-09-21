@@ -20,6 +20,7 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
@@ -34,13 +35,17 @@ import java.util.UUID;
  * plus all steps {@code COMPLETED} cannot exist.
  *
  * <p><strong>Leftovers:</strong> Phase 2 resumes never-started {@code PENDING} and due
- * {@code RUNNING} steps (attempt++). {@code FAILED} stays terminal. A leftover
- * {@code RUNNING} whose next attempt would exceed {@link RetryPolicy#maxAttempts()}
- * becomes poison {@code RETRY_EXHAUSTED}.
+ * {@code RUNNING} steps (attempt++) while {@code deadline_at} is still in the
+ * future. {@code FAILED} stays terminal. A leftover {@code RUNNING} whose next
+ * attempt would exceed {@link RetryPolicy#maxAttempts()} becomes poison
+ * {@code RETRY_EXHAUSTED}. A due {@code deadline_at} becomes {@code FAILED}
+ * with {@link #TIMED_OUT_ERROR} and is not re-invoked.
  *
- * <p>Runs on {@code workflow-*} threads, never the HTTP request thread. This
- * class must not import the in-process stub package. Infrastructure failures are
- * logged and stop the run; they do not mark the step {@code FAILED}.
+ * <p>Runs on {@code workflow-*} threads, never the HTTP request thread.
+ * {@link #timeoutIfDue} also runs on the scheduler thread. This class must not
+ * import the in-process stub package. Infrastructure failures are logged and
+ * stop the run; they do not mark the step {@code FAILED}. A completion that
+ * arrives after a timeout is discarded.
  *
  * @implNote Happy-path terminal {@code version == 10}. Mid-step success TXs
  * bump {@code @Version} with {@link LockModeType#OPTIMISTIC_FORCE_INCREMENT}.
@@ -48,6 +53,14 @@ import java.util.UUID;
 @Slf4j
 @Component
 public class WorkflowExecutor {
+
+    /**
+     * Step and instance {@code error} when {@code deadline_at} is due.
+     * Status stays {@code FAILED}. {@code attempt} is not incremented.
+     */
+    public static final String TIMED_OUT_ERROR = "TIMED_OUT";
+
+    private static final int TIMEOUT_STRIPES = 32;
 
     private final WorkflowInstanceRepository instances;
     private final WorkflowDefinitionRegistry definitions;
@@ -57,6 +70,12 @@ public class WorkflowExecutor {
     private final Clock clock;
 
     /**
+     * Serializes {@link #timeoutIfDue} so the ready-event pass and the
+     * scheduler pass cannot both flush a timeout for the same instance.
+     */
+    private final Object[] timeoutStripes;
+
+    /**
      * Builds an executor that opens its own {@link TransactionTemplate} per unit of work.
      *
      * @param instances instance repository
@@ -64,7 +83,7 @@ public class WorkflowExecutor {
      * @param invoker sync activity port
      * @param transactionManager not used as a class-level {@code @Transactional}
      * @param entityManager used to force {@code @Version} bumps and stamp timestamps
-     * @param clock backoff due-time for leftover {@code RUNNING} steps
+     * @param clock backoff due-time and step-deadline clock for {@code RUNNING} steps
      */
     public WorkflowExecutor(
             WorkflowInstanceRepository instances,
@@ -80,6 +99,10 @@ public class WorkflowExecutor {
         this.tx = new TransactionTemplate(transactionManager);
         this.entityManager = entityManager;
         this.clock = clock;
+        this.timeoutStripes = new Object[TIMEOUT_STRIPES];
+        for (int i = 0; i < TIMEOUT_STRIPES; i++) {
+            this.timeoutStripes[i] = new Object();
+        }
     }
 
     /**
@@ -140,16 +163,67 @@ public class WorkflowExecutor {
             ));
 
             boolean last = position == steps.size() - 1;
-            if (!result.success()) {
-                tx.executeWithoutResult(status -> failStep(workflowId, position, result));
+            Boolean wrote = tx.execute(status -> {
+                if (!result.success()) {
+                    return failStep(workflowId, position, result);
+                }
+                if (last) {
+                    return completeLastStep(workflowId, position, result);
+                }
+                return completeMidStep(workflowId, position, result);
+            });
+            if (!result.success() || !Boolean.TRUE.equals(wrote)) {
                 return;
             }
-            if (last) {
-                tx.executeWithoutResult(status -> completeLastStep(workflowId, position, result));
-            } else {
-                tx.executeWithoutResult(status -> completeMidStep(workflowId, position, result));
+        }
+    }
+
+    /**
+     * Step-fail transaction for a due {@code deadline_at}, if the step is still
+     * {@code RUNNING}. Does not invoke the activity and does not increment
+     * {@code attempt}.
+     *
+     * <p>Called on the scheduler thread with no open workflow transaction.
+     * Startup runs {@code onReady} and the first scheduled tick together, so
+     * callers for the same id are serialized. The second pass sees
+     * {@code FAILED} and does not write. A concurrent completion from the
+     * executor thread still loses or wins on {@code @Version}. That loser
+     * logs an infrastructure failure and stops; the committed row stands.
+     *
+     * @param workflowId instance id
+     */
+    public void timeoutIfDue(UUID workflowId) {
+        synchronized (timeoutStripe(workflowId)) {
+            try {
+                tx.executeWithoutResult(status -> applyTimeoutIfDue(workflowId));
+            } catch (RuntimeException ex) {
+                log.error("executor infrastructure failure workflowId={} reason=timeout", workflowId, ex);
             }
         }
+    }
+
+    /**
+     * Lock stripe for {@link #timeoutIfDue}. Not a per-id lock; two workflows
+     * can share a stripe and wait briefly.
+     *
+     * @param workflowId instance id
+     * @return monitor for that stripe
+     */
+    private Object timeoutStripe(UUID workflowId) {
+        int index = (workflowId.hashCode() & Integer.MAX_VALUE) % TIMEOUT_STRIPES;
+        return timeoutStripes[index];
+    }
+
+    /**
+     * True when {@code deadline} is non-null and not after {@code now}.
+     * Equal instants are due. Null means the step has no timeout.
+     *
+     * @param deadline {@code workflow_step.deadline_at}; may be null
+     * @param now engine clock instant
+     * @return whether the poller or a running-resume should fail the attempt
+     */
+    static boolean deadlineDue(Instant deadline, Instant now) {
+        return deadline != null && !deadline.isAfter(now);
     }
 
     /**
@@ -168,12 +242,12 @@ public class WorkflowExecutor {
     }
 
     /**
-     * Chooses skip (already {@code COMPLETED}), stop (terminal, not due, or poison),
+     * Chooses skip (already {@code COMPLETED}), stop (terminal, not due, timed out, or poison),
      * or run (step-start / leftover resume).
      *
      * @param workflowId instance id
      * @param position step index
-     * @param stepDef name and retry policy
+     * @param stepDef name, retry policy, and per-attempt timeout
      * @return prepared action; never null
      */
     private Prepared prepareStep(UUID workflowId, int position, StepDefinition stepDef) {
@@ -190,25 +264,33 @@ public class WorkflowExecutor {
             return Prepared.stop();
         }
         if (step.getStatus() == StepStatus.PENDING) {
-            return Prepared.run(startStep(instance, step, stepDef.name()));
+            return Prepared.run(startStep(instance, step, stepDef.name(), stepDef.timeout()));
         }
-        return resumeRunning(instance, step, stepDef.retryPolicy());
+        return resumeRunning(instance, step, stepDef.retryPolicy(), stepDef.timeout());
     }
 
     /**
      * Step-start transaction: step {@code PENDING→RUNNING}, increment {@code attempt}, set
-     * instance {@code RUNNING} and {@code current_step}, stamp {@code started_at}.
+     * instance {@code RUNNING} and {@code current_step}, stamp {@code started_at}
+     * from the database and {@code deadline_at} from the engine clock.
      *
      * @param instance loaded aggregate
      * @param step {@code PENDING} step
      * @param stepName definition name
+     * @param timeout per-attempt limit; null means no deadline
      * @return attempt after increment
      */
-    private int startStep(WorkflowInstanceEntity instance, WorkflowStepEntity step, String stepName) {
+    private int startStep(
+            WorkflowInstanceEntity instance,
+            WorkflowStepEntity step,
+            String stepName,
+            Duration timeout
+    ) {
         int attempt = step.getAttempt() + 1;
         step.setStatus(StepStatus.RUNNING);
         step.setAttempt(attempt);
         step.setNextAttemptAt(null);
+        step.setDeadlineAt(deadlineFor(clock.instant(), timeout));
         instance.setStatus(WorkflowStatus.RUNNING);
         instance.setCurrentStep(stepName);
         stampStartedAt(step);
@@ -219,21 +301,31 @@ public class WorkflowExecutor {
     }
 
     /**
-     * Resume leftover {@code RUNNING}: increment {@code attempt}, then invoke
-     * again. Not due yet → stop. Next attempt above {@code maxAttempts} →
-     * poison {@code FAILED}.
+     * Resume leftover {@code RUNNING}, or fail it when the deadline is due.
+     * A due deadline wins over backoff and over {@code RETRY_EXHAUSTED}:
+     * the attempt is not incremented and the activity is not invoked.
+     * Otherwise: not due yet → stop; next attempt above {@code maxAttempts}
+     * → poison {@code FAILED}; else increment {@code attempt}, refresh
+     * {@code deadline_at}, then invoke again.
      *
      * @param instance loaded aggregate
      * @param step the {@code RUNNING} step
      * @param retryPolicy attempt cap and backoff
+     * @param timeout per-attempt limit applied to the new attempt; null means no deadline
      * @return run with the new attempt, or stop
      */
     private Prepared resumeRunning(
             WorkflowInstanceEntity instance,
             WorkflowStepEntity step,
-            RetryPolicy retryPolicy
+            RetryPolicy retryPolicy,
+            Duration timeout
     ) {
         Instant now = clock.instant();
+        if (deadlineDue(step.getDeadlineAt(), now)) {
+            failStep(instance.getId(), step.getPosition(),
+                    new ActivityResult(false, null, TIMED_OUT_ERROR));
+            return Prepared.stop();
+        }
         Instant next = step.getNextAttemptAt();
         if (next != null && next.isAfter(now)) {
             return Prepared.stop();
@@ -248,6 +340,7 @@ public class WorkflowExecutor {
         step.setNextAttemptAt(retryPolicy.initialBackoff().isZero()
                 ? null
                 : now.plus(retryPolicy.initialBackoff()));
+        step.setDeadlineAt(deadlineFor(now, timeout));
         entityManager.lock(instance, LockModeType.OPTIMISTIC_FORCE_INCREMENT);
 
         log.info("step resumed workflowId={} type={} step={} attempt={} status=RUNNING version={}",
@@ -262,10 +355,14 @@ public class WorkflowExecutor {
      * @param workflowId instance id
      * @param position step index
      * @param result successful activity output
+     * @return false when the step is no longer {@code RUNNING} (timeout won) and the success was discarded
      */
-    private void completeMidStep(UUID workflowId, int position, ActivityResult result) {
+    private boolean completeMidStep(UUID workflowId, int position, ActivityResult result) {
         WorkflowInstanceEntity instance = instances.findById(workflowId).orElseThrow();
         WorkflowStepEntity step = stepAt(instance, position);
+        if (!stillRunning(instance, step)) {
+            return false;
+        }
         step.setStatus(StepStatus.COMPLETED);
         step.setOutputJson(result.outputJson());
         step.setError(null);
@@ -274,6 +371,7 @@ public class WorkflowExecutor {
 
         log.info("step completed workflowId={} type={} step={} attempt={} status=COMPLETED version={}",
                 workflowId, instance.getType(), step.getName(), step.getAttempt(), instance.getVersion());
+        return true;
     }
 
     /**
@@ -283,10 +381,14 @@ public class WorkflowExecutor {
      * @param workflowId instance id
      * @param position last step index
      * @param result successful activity output
+     * @return false when the step is no longer {@code RUNNING} and the success was discarded
      */
-    private void completeLastStep(UUID workflowId, int position, ActivityResult result) {
+    private boolean completeLastStep(UUID workflowId, int position, ActivityResult result) {
         WorkflowInstanceEntity instance = instances.findById(workflowId).orElseThrow();
         WorkflowStepEntity step = stepAt(instance, position);
+        if (!stillRunning(instance, step)) {
+            return false;
+        }
         step.setStatus(StepStatus.COMPLETED);
         step.setOutputJson(result.outputJson());
         step.setError(null);
@@ -298,19 +400,28 @@ public class WorkflowExecutor {
 
         log.info("workflow completed workflowId={} type={} step={} attempt={} status=COMPLETED version={}",
                 workflowId, instance.getType(), step.getName(), step.getAttempt(), instance.getVersion());
+        return true;
     }
 
     /**
      * Step-fail transaction: step and instance {@code FAILED}. Instance {@code output_json}
-     * stays null. Terminal; Phase 2 does not retry {@code FAILED}.
+     * stays null. Terminal; {@code FAILED} is not retried.
+     *
+     * <p>No-ops when the step or instance is no longer {@code RUNNING}. That is
+     * how a late activity result loses to a timeout that already committed.
+     * Must be called inside the caller's workflow transaction.
      *
      * @param workflowId instance id
      * @param position failed step index
-     * @param result unsuccessful activity result
+     * @param result unsuccessful activity result, or {@code TIMED_OUT_ERROR}
+     * @return false when the failure was discarded because the step already left {@code RUNNING}
      */
-    private void failStep(UUID workflowId, int position, ActivityResult result) {
+    private boolean failStep(UUID workflowId, int position, ActivityResult result) {
         WorkflowInstanceEntity instance = instances.findById(workflowId).orElseThrow();
         WorkflowStepEntity step = stepAt(instance, position);
+        if (!stillRunning(instance, step)) {
+            return false;
+        }
         step.setStatus(StepStatus.FAILED);
         step.setError(result.error());
         if (result.outputJson() != null) {
@@ -324,6 +435,59 @@ public class WorkflowExecutor {
 
         log.info("workflow failed workflowId={} type={} step={} attempt={} status=FAILED version={}",
                 workflowId, instance.getType(), step.getName(), step.getAttempt(), instance.getVersion());
+        return true;
+    }
+
+    /**
+     * Applies {@link #TIMED_OUT_ERROR} when this instance still has a due
+     * {@code RUNNING} step. No-op otherwise. Runs inside {@link #timeoutIfDue}'s
+     * transaction.
+     *
+     * @param workflowId instance id
+     */
+    private void applyTimeoutIfDue(UUID workflowId) {
+        WorkflowInstanceEntity instance = instances.findById(workflowId).orElse(null);
+        if (instance == null || instance.getStatus() != WorkflowStatus.RUNNING) {
+            return;
+        }
+        Instant now = clock.instant();
+        for (WorkflowStepEntity step : instance.getSteps()) {
+            if (step.getStatus() == StepStatus.RUNNING && deadlineDue(step.getDeadlineAt(), now)) {
+                failStep(workflowId, step.getPosition(), new ActivityResult(false, null, TIMED_OUT_ERROR));
+                return;
+            }
+        }
+    }
+
+    /**
+     * Whether a completion or failure write is still allowed.
+     *
+     * @param instance loaded aggregate
+     * @param step step the executor intended to finish
+     * @return true only when both are still {@code RUNNING}
+     */
+    private boolean stillRunning(WorkflowInstanceEntity instance, WorkflowStepEntity step) {
+        if (step.getStatus() == StepStatus.RUNNING && instance.getStatus() == WorkflowStatus.RUNNING) {
+            return true;
+        }
+        log.info("step write skipped workflowId={} type={} step={} attempt={} status={} version={} reason=not_running",
+                instance.getId(), instance.getType(), step.getName(), step.getAttempt(),
+                step.getStatus(), instance.getVersion());
+        return false;
+    }
+
+    /**
+     * End of this attempt on the engine clock. Null when the definition has no timeout.
+     *
+     * @param now clock instant at step-start or running-resume
+     * @param timeout per-attempt limit; null means no deadline
+     * @return deadline to store, or null
+     */
+    private static Instant deadlineFor(Instant now, Duration timeout) {
+        if (timeout == null) {
+            return null;
+        }
+        return now.plus(timeout);
     }
 
     /**

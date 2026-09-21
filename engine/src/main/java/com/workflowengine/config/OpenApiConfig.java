@@ -12,7 +12,7 @@ import org.springframework.context.annotation.Configuration;
  * {@code /v3/api-docs}. Localhost only; no auth. Try-it-out calls the live
  * engine on this process.
  *
- * <p>Spring singleton. Does not change admit-then-run or the scanner.
+ * <p>Spring singleton. Does not change admit-then-run, recovery, or timeouts.
  */
 @Configuration
 public class OpenApiConfig {
@@ -32,6 +32,7 @@ public class OpenApiConfig {
                         and returns that admit snapshot (version 0); poll GET until \
                         COMPLETED or FAILED. Idempotent POST with the same key returns 200 \
                         and does not start a second run. Phase 2 recovery resumes leftovers \
-                        after crash; FAILED is not retried."""));
+                        after crash. A step that stays RUNNING past its deadline fails \
+                        with error TIMED_OUT. FAILED is not retried."""));
     }
 }

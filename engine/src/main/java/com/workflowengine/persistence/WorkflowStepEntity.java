@@ -24,8 +24,11 @@ import java.util.UUID;
  * instance together with {@code name}.
  *
  * <p>{@code input_json} stays SQL {@code NULL}. {@code started_at} and
- * {@code completed_at} are stamped with PostgreSQL {@code now()}. A leftover
- * {@code RUNNING} row is resumed by Phase 2 (attempt++); {@code FAILED} is not.
+ * {@code completed_at} are stamped with PostgreSQL {@code now()}.
+ * {@code next_attempt_at} and {@code deadline_at} are instants from the engine
+ * clock. A leftover {@code RUNNING} row inside its deadline is resumed by the
+ * recovery scanner (attempt++). A due deadline is failed with error
+ * {@code TIMED_OUT}. {@code FAILED} is not retried.
  *
  * <p>Not thread-safe. Lombok generates getters, setters, and the JPA constructor.
  */
@@ -92,4 +95,13 @@ public class WorkflowStepEntity {
      */
     @Column(name = "next_attempt_at")
     private Instant nextAttemptAt;
+
+    /**
+     * Engine-clock end of the current attempt. Null means the definition has
+     * no timeout, including rows written before the column existed. The
+     * Phase 3 poller fails a {@code RUNNING} step when this instant is due.
+     * Refreshed on running-resume so each attempt gets a full window.
+     */
+    @Column(name = "deadline_at")
+    private Instant deadlineAt;
 }

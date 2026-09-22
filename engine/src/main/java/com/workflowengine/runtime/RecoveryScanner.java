@@ -27,7 +27,12 @@ import java.util.List;
  *
  * <p>Runs on the scheduler thread (and once at {@link ApplicationReadyEvent}).
  * Submit is asynchronous. A {@code RUNNING} step with {@code next_attempt_at}
- * in the future is left for a later pass (backoff).
+ * in the future is left for a later pass (backoff). A step whose
+ * {@code deadline_at} is already due is not submitted. {@link TimeoutPoller}
+ * fails that attempt. An invoke that is already in flight in this process is
+ * not submitted twice; the poller does not use the dispatcher, so it can still
+ * fail the in-flight row. If a submit races and the deadline elapses before
+ * resume, {@link WorkflowExecutor} writes {@code TIMED_OUT} instead of invoking.
  */
 @Slf4j
 @Component
@@ -88,6 +93,14 @@ public class RecoveryScanner {
         }
     }
 
+    /**
+     * Whether this leftover should be submitted. A due {@code deadline_at}
+     * is excluded so the timeout poller is the writer for that row.
+     *
+     * @param instance aggregate with steps loaded
+     * @param now engine clock instant for this pass
+     * @return true when the scanner should submit
+     */
     private static boolean due(WorkflowInstanceEntity instance, Instant now) {
         if (instance.getStatus() == WorkflowStatus.PENDING) {
             return instance.getSteps().stream().allMatch(step -> step.getStatus() == StepStatus.PENDING);
@@ -100,7 +113,17 @@ public class RecoveryScanner {
                 .anyMatch(step -> isDue(step, now));
     }
 
+    /**
+     * Resume is due when the attempt has not timed out and backoff has elapsed.
+     *
+     * @param step a {@code RUNNING} step
+     * @param now engine clock instant for this pass
+     * @return false when {@code deadline_at} is due or {@code next_attempt_at} is still in the future
+     */
     private static boolean isDue(WorkflowStepEntity step, Instant now) {
+        if (WorkflowExecutor.deadlineDue(step.getDeadlineAt(), now)) {
+            return false;
+        }
         Instant next = step.getNextAttemptAt();
         return next == null || !next.isAfter(now);
     }

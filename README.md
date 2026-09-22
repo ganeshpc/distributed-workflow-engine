@@ -4,7 +4,7 @@ A Java 21 / Spring Boot 4.1 workflow **orchestrator**. It coordinates a linear e
 
 This is **not** Temporal. There is no event-sourced history, no deterministic replay of workflow code, and no task-queue matching. The engine stores *where the saga is now* (`PENDING` / `RUNNING` / `COMPLETED` / `FAILED`) and commits each transition before it calls the next activity.
 
-**Current stage: Phase 2.** One Spring Boot process plus Postgres. Activities are in-process stubs (canned JSON, no real orders or payments). After a crash, a scanner resumes never-started admissions and leftover `RUNNING` steps. `FAILED` is not retried. How this maps to Kafka, workers, idempotency, and compensation is in [Current code vs the end goal](#current-code-vs-the-end-goal).
+**Current stage: Phase 3.** One Spring Boot process plus Postgres. Activities are in-process stubs (canned JSON, no real orders or payments). After a crash, a scanner resumes never-started admissions and leftover `RUNNING` steps that are still inside their deadline. A step that stays `RUNNING` past `deadline_at` fails with error `TIMED_OUT`. `FAILED` is not retried. How this maps to Kafka, workers, idempotency, and compensation is in [Current code vs the end goal](#current-code-vs-the-end-goal).
 
 The design contract is [`docs/architecture.md`](docs/architecture.md). Agent rules are in [`AGENTS.md`](AGENTS.md).
 
@@ -22,11 +22,12 @@ The design contract is [`docs/architecture.md`](docs/architecture.md). Agent rul
 8. [Happy-path state table](#happy-path-state-table)
 9. [Scenarios](#scenarios)
 10. [What changed in Phase 2](#what-changed-in-phase-2)
-11. [Current code vs the end goal](#current-code-vs-the-end-goal)
-12. [HTTP contract](#http-contract)
-13. [Configuration](#configuration)
-14. [Tests](#tests)
-15. [Roadmap](#roadmap)
+11. [What changed in Phase 3](#what-changed-in-phase-3)
+12. [Current code vs the end goal](#current-code-vs-the-end-goal)
+13. [HTTP contract](#http-contract)
+14. [Configuration](#configuration)
+15. [Tests](#tests)
+16. [Roadmap](#roadmap)
 
 ---
 
@@ -119,7 +120,7 @@ distributed-workflow-engine/     Maven aggregator; imports Spring Boot 4.1 BOM
 | `com.workflowengine.domain` / `definition` | `ORDER` graph, `RetryPolicy`. |
 | `com.workflowengine.activity` | `ActivityInvoker` (sync in-process port). |
 | `com.workflowengine.activity.stub` | Demo adapters + `failAt` + test hooks. |
-| `com.workflowengine.runtime` | `WorkflowExecutor`, `WorkflowDispatcher`, `RecoveryScanner`. |
+| `com.workflowengine.runtime` | `WorkflowExecutor`, `WorkflowDispatcher`, `RecoveryScanner`, `TimeoutPoller`. |
 | `com.workflowengine.persistence` | JPA entities and Spring Data. |
 | `com.workflowengine.config` | Task executor, clock, daemon scheduler. |
 
@@ -151,7 +152,7 @@ Committed state left after a crash or a lost submit:
 |---|---|
 | Instance `PENDING`, all steps `PENDING` | Admit committed; first step-start never ran (or submit was lost). |
 | Instance `RUNNING`, one step `RUNNING` | Crash during invoke after the step-start commit. |
-| Instance `FAILED` | Terminal. Phase 2 does not retry it. |
+| Instance `FAILED` | Terminal. Not retried. A timeout is this status with error `TIMED_OUT`. |
 
 ### Optimistic locking
 
@@ -171,6 +172,16 @@ Demo failure injection on stubs only. If input JSON contains `"failAt":"PROCESS_
 
 Re-invoking a leftover `RUNNING` step can run the stub a second time. Stubs are not idempotent. Real side effects need Phase 6 (activity idempotency). Phase 2 makes **progress** after crash; it does not make side effects exactly-once.
 
+### Step timeout (Phase 3)
+
+Each ORDER step has a 5-minute per-attempt deadline (`OrderWorkflowDefinition.STEP_TIMEOUT`). Step-start and running-resume store it on `workflow_step.deadline_at` using the engine `Clock`, not PostgreSQL `now()`.
+
+`TimeoutPoller` loads `RUNNING` instances on startup and every `workflow.timeout.interval-ms`. A due deadline commits step and instance `FAILED` with error `TIMED_OUT`. `attempt` does not increase. The activity is not called again. Later steps stay `PENDING`.
+
+The poller does not submit through `WorkflowDispatcher`. That inflight set would skip a workflow whose stub is still inside `execute`. The stub is not interrupted. If it returns success afterward, the completion is discarded and the walk stops.
+
+A crash leftover whose deadline is already due fails the same way. Timeout wins over another attempt and over `RETRY_EXHAUSTED`. `FAILED` stays terminal. There is no `TIMED_OUT` status value.
+
 ---
 
 ## Named transactions
@@ -180,12 +191,12 @@ Do not number them TX1/TX2. Names describe the unit of work:
 | Name | Writes | Then |
 |---|---|---|
 | **Admit** | Instance `PENDING`, `version=0`, five steps `PENDING`, `attempt=0` | HTTP may return `201`. Only the INSERT winner submits the executor. |
-| **First step-start** | First step `RUNNING`, `attempt=1`, `started_at=now()`; instance `RUNNING`, `current_step=CREATE_ORDER`; `version` 0→1 | **Commit. Then** invoke. |
-| **Step-start** | Later step `RUNNING`, `attempt++`, `started_at=now()`; instance `current_step` updated; `version` +1 | **Commit. Then** invoke. |
+| **First step-start** | First step `RUNNING`, `attempt=1`, `started_at=now()`, `deadline_at` from the engine clock; instance `RUNNING`, `current_step=CREATE_ORDER`; `version` 0→1 | **Commit. Then** invoke. |
+| **Step-start** | Later step `RUNNING`, `attempt++`, `started_at=now()`, `deadline_at` refreshed; instance `current_step` updated; `version` +1 | **Commit. Then** invoke. |
 | **Mid-step complete** | Step `COMPLETED`, `output_json`, `completed_at=now()`; instance status unchanged; `version` +1 | Next step-start. |
 | **Workflow-complete** | Last step `COMPLETED` **and** instance `COMPLETED` in **one** commit; instance `output_json` = last step output | Stop. |
-| **Step-fail** | Step and instance `FAILED` in one commit; instance `output_json=null`; later steps stay `PENDING` | Stop. |
-| **Running-resume** (Phase 2) | Leftover `RUNNING` step: `attempt++`, `@Version` bump | **Commit. Then** invoke again. |
+| **Step-fail** | Step and instance `FAILED` in one commit; instance `output_json=null`; later steps stay `PENDING`. Timeout uses this transaction with error `TIMED_OUT` and does not increment `attempt`. | Stop. A write is skipped when the step is no longer `RUNNING`. |
+| **Running-resume** (Phase 2) | Leftover `RUNNING` step still inside `deadline_at`: `attempt++`, refresh `deadline_at`, `@Version` bump. If `deadline_at` is due, this transaction is a step-fail (`TIMED_OUT`) instead. | **Commit. Then** invoke again, unless the deadline was due. |
 
 Fold instance `PENDING→RUNNING` into first step-start. Do not add a separate instance-only `RUNNING` transaction.
 
@@ -199,8 +210,9 @@ Flyway only. `spring.jpa.hibernate.ddl-auto=none`. Migrations:
 
 - `V1__init.sql` — instance + step tables, unique keys, status index, `updated_at` trigger.
 - `V2__step_next_attempt_at.sql` — Phase 2: `workflow_step.next_attempt_at` and a partial index.
+- `V3__step_deadline_at.sql` — Phase 3: `workflow_step.deadline_at` and a partial index.
 
-JSON is `JSONB`. Timestamps are `TIMESTAMPTZ` assigned by PostgreSQL (`now()`), not `Instant.now()` in Java. Tests must not assert equality with the JVM clock.
+JSON is `JSONB`. `started_at`, `completed_at`, `created_at`, and `updated_at` are `TIMESTAMPTZ` assigned by PostgreSQL (`now()`). `next_attempt_at` and `deadline_at` are written from the engine `Clock`. Tests must not assert equality with `Instant.now()` from the JVM.
 
 ### `workflow_instance`
 
@@ -235,6 +247,7 @@ Indexes: unique `idempotency_key`; `idx_workflow_instance_status` for the Phase 
 | `error` | Set on `FAILED`. |
 | `started_at` / `completed_at` | DB `now()` at start / complete-or-fail. |
 | `next_attempt_at` | Phase 2. When a leftover `RUNNING` step is due. `NULL` means due now. `FAILED` ignores this. |
+| `deadline_at` | Phase 3. Engine-clock end of the current attempt. `NULL` means no timeout. Due + `RUNNING` → `FAILED` / `TIMED_OUT`. Refreshed on running-resume. |
 
 ### How rows change (happy path, no crash)
 
@@ -274,20 +287,20 @@ Crash after first step-start (`version=1`, step 0 `RUNNING`, `attempt=1`). Scann
 `WorkflowExecutor.execute`:
 
 1. Load type, `definition_version`, and `input_json` once (**seed**). Every activity gets that same input.
-2. Resolve `OrderWorkflowDefinition` (five `StepDefinition`s, default `RetryPolicy` maxAttempts=3, backoff=0).
+2. Resolve `OrderWorkflowDefinition` (five `StepDefinition`s, default `RetryPolicy` maxAttempts=3, backoff=0, timeout 5 minutes).
 3. For each position 0..4:
    - **prepareStep** (own transaction):
      - Instance `COMPLETED` / `FAILED` → stop.
      - Step `COMPLETED` → skip (continue walk). This is how resume continues after earlier steps already finished.
      - Step `FAILED` → stop.
-     - Step `PENDING` → **step-start** (`RUNNING`, `attempt++`, `started_at=now()`, instance `RUNNING`).
-     - Step `RUNNING` → **running-resume** (Phase 2): if `next_attempt_at` is in the future, stop; if `attempt+1 > maxAttempts`, **step-fail** with `RETRY_EXHAUSTED`; else `attempt++`, bump `@Version`, then invoke.
+     - Step `PENDING` → **step-start** (`RUNNING`, `attempt++`, `started_at=now()`, `deadline_at` from the engine clock, instance `RUNNING`).
+     - Step `RUNNING` → **running-resume** (Phase 2): if `deadline_at` is due, **step-fail** with `TIMED_OUT` and do not invoke; if `next_attempt_at` is in the future, stop; if `attempt+1 > maxAttempts`, **step-fail** with `RETRY_EXHAUSTED`; else `attempt++`, refresh `deadline_at`, bump `@Version`, then invoke.
    - **Invoke** `ActivityInvoker` with **no** workflow transaction. `InProcessActivityInvoker` looks up the stub by name. Lookup miss → `UNKNOWN_ACTIVITY`. Thrown exception → `ACTIVITY_EXCEPTION`. Stubs may honor `failAt` and test block hooks.
-   - On `success=false` → **step-fail** transaction, stop.
-   - On success, last step → **workflow-complete** (step + instance `COMPLETED` together).
-   - On success, not last → **mid-step complete**, then next position.
+   - On `success=false` → **step-fail** transaction, stop. If the step is no longer `RUNNING`, the write is skipped and the walk stops.
+   - On success, last step → **workflow-complete** (step + instance `COMPLETED` together), unless the step is no longer `RUNNING`.
+   - On success, not last → **mid-step complete**, then next position. A skipped write (timeout already committed) stops the walk. It does not start the next step.
 
-Infrastructure failures (persistence, `@Version` conflict) are caught in `run`, logged ERROR, and **stop**. They do **not** mark the step `FAILED`. `GET` still returns 200 with the leftover. Phase 2 scanner will try again.
+Infrastructure failures (persistence, `@Version` conflict) are caught in `run`, logged ERROR, and **stop**. They do **not** mark the step `FAILED`. `GET` still returns 200 with the leftover. The recovery scanner retries a leftover that is still inside its deadline. The timeout poller fails one that is not.
 
 ### C. `GET /api/v1/workflows/{id}` (request thread)
 
@@ -303,7 +316,16 @@ Infrastructure failures (persistence, `@Version` conflict) are caught in `run`, 
 - Due **RUNNING**: a `RUNNING` step with `next_attempt_at` null or ≤ now → `dispatcher.submit`.
 - Never selects `FAILED` or `COMPLETED`.
 
-Same-process duplicates: dispatcher inflight set. After a process crash the set is empty, so leftovers submit again.
+Same-process duplicates: dispatcher inflight set. After a process crash the set is empty, so leftovers submit again. A due `deadline_at` is not submitted; the timeout poller fails that step. If a submit is already queued and the deadline elapses before resume, the executor writes `TIMED_OUT` instead of invoking.
+
+### E. Timeout poller (Phase 3)
+
+`TimeoutPoller`:
+
+- Runs once on `ApplicationReadyEvent` and every `workflow.timeout.interval-ms` (default 2000). The interval is the poll period, not the step timeout.
+- Loads `RUNNING` instances. A `RUNNING` step with `deadline_at <=` the engine clock is failed in place (`FAILED`, error `TIMED_OUT`).
+- Does not call `WorkflowDispatcher`, so an in-flight `execute` cannot hide the row. The stub keeps running until it returns; the later complete or fail write is skipped.
+- `workflow.timeout.enabled=false` stops this scan only. Running-resume still fails an already-due leftover.
 
 ---
 
@@ -367,7 +389,13 @@ Default `maxAttempts=3`. First start uses attempt 1. Each running-resume increme
 
 ### 9. Executor-thread infrastructure failure
 
-Persistence or `@Version` conflict on the `workflow-*` thread: log ERROR, stop, do not mark `FAILED`. GET is 200 with leftover. Scanner may submit again.
+Persistence or `@Version` conflict on the `workflow-*` thread: log ERROR, stop, do not mark `FAILED`. GET is 200 with leftover. Scanner may submit again if the deadline is still in the future.
+
+### 10. Step timeout (Phase 3)
+
+`CREATE_ORDER` is blocked inside `execute` (`RUNNING`, `attempt=1`, `version=1`, `deadline_at` set). A poller pass before the deadline changes nothing. Move the engine clock past `deadline_at` and scan again: instance `FAILED`, error `TIMED_OUT`, attempt stays 1, later steps `PENDING`, `version=2`. Release the stub. The late success does not overwrite `FAILED` and does not start `RESERVE_INVENTORY`.
+
+Restart after the deadline has passed: the new process does not invoke the stub again. `attempt` stays 1.
 
 ---
 
@@ -389,9 +417,26 @@ Phase 1 left leftovers stuck on purpose: restart did **not** resume, and idempot
 | Durability test | New context must **not** increment stub counter | New context **must** re-invoke (`attempt=2`) then complete |
 | Tests | 24 | 26 (`WorkflowRecoveryTest`: pending resume + failed-not-retried) |
 
+---
+
+## What changed in Phase 3
+
+Phase 2 would re-invoke a `RUNNING` step whenever `next_attempt_at` was due, with no limit on how long the attempt could sit there. Phase 3 adds that limit.
+
+| Area | Phase 2 | Phase 3 |
+|---|---|---|
+| How long a step may stay `RUNNING` | Unbounded | `deadline_at` = engine clock + `StepDefinition.timeout` (ORDER: 5 minutes) |
+| Deadline elapsed while `execute` is in progress | Invoke finishes and may complete the step | Poller commits `FAILED` / `TIMED_OUT`. Late success is discarded. |
+| Deadline elapsed across a crash | Next process re-invokes (`attempt++`) | Next process fails the step. No second invoke. `attempt` stays. |
+| Status value | `FAILED` for activity failure and `RETRY_EXHAUSTED` | Same `FAILED`. Timeout is the error text `TIMED_OUT`, not a new enum. |
+| Schema | `V2` `next_attempt_at` | `V3` `deadline_at` |
+| Startup | Recovery scan | Recovery scan and timeout scan |
+
+A null `deadline_at` never times out. Rows that were already `RUNNING` when `V3` was added stay on the Phase 2 resume path until something refreshes the deadline.
+
 **New types:** `RetryPolicy`, `WorkflowDispatcher`, `RecoveryScanner`. **New config:** `workflow.recovery.enabled` (default true), `workflow.recovery.interval-ms` (default 2000). **Clock** bean for due-time. Daemon `TaskScheduler` so recovery ticks do not keep the JVM alive after shutdown.
 
-**Unchanged on purpose:** REST paths, admit snapshot (`201` still `PENDING`/`version=0`), no Kafka, no worker module, no compensation, no timeout poller, stubs still canned JSON.
+**Unchanged on purpose:** REST paths, admit snapshot (`201` still `PENDING`/`version=0`), no Kafka, no worker module, no compensation, stubs still canned JSON. No `TIMED_OUT` status value.
 
 ---
 
@@ -435,13 +480,13 @@ Postgres remains the source of truth for orchestration metadata. Kafka, when it 
 |---|---|
 | `RecoveryScanner` finds `PENDING` / `RUNNING` in Postgres and calls `WorkflowDispatcher.submit` → in-process `WorkflowExecutor.run` | Same leftover rows. Scanner **republishes** stale `RUNNING` tasks to Kafka instead of invoking locally. Lost messages are recovered from committed `RUNNING`, not from Kafka as SoT. |
 | Inflight set is in-memory (one process) | Multi-instance engines claim rows with `SELECT … FOR UPDATE SKIP LOCKED` (Phase 9). `@Version` rejects stale writers. |
-| `FAILED` is never retried | Retry policy on `FAILED` can be turned on once backoff/`next_attempt_at` are used for that path. Timeouts become `FAILED` or a later `TIMED_OUT` (Phase 3). |
+| `FAILED` is never retried, including error `TIMED_OUT` | Retry policy on `FAILED` can be turned on once backoff/`next_attempt_at` are used for that path. A distinct `TIMED_OUT` status waits until a phase branches on it. |
 
 ### Time, failure, and side effects
 
 | Concern | Now | End goal |
 |---|---|---|
-| Time | No step timeout. Backoff field exists (`next_attempt_at`) but ORDER uses zero delay. | Phase 3: poller marks overdue `RUNNING` failed-by-timeout (rows + clock, not `Thread.sleep`). Phase 10: first-class timer *steps*. |
+| Time | Per-attempt `deadline_at` (ORDER: 5 minutes). Poller fails a due `RUNNING` step with `TIMED_OUT`. Backoff field exists; ORDER uses zero delay. | Phase 10: first-class timer *steps*. The poller is not that. |
 | Activity failure | Stub `failAt` or `success=false` → step-fail; instance `FAILED`; later steps stay `PENDING`. | Same forward fail, then **compensation** (Phase 7): reverse walk of completed steps, states `COMPENSATING` / `COMPENSATED`. Requires Phase 6. |
 | Double invoke after crash | Real: stub runs twice. Documented. Stubs have no money/stock. | Phase 6: worker idempotency store “this attempt already completed.” Effectively-once = at-least-once delivery + idempotent handler. **Hard gate** before real payment/inventory. |
 | `failAt` | Stubs honor it always. | Workers ignore `failAt` unless `spring.profiles.active=test`. |
@@ -458,16 +503,18 @@ Postgres remains the source of truth for orchestration metadata. Kafka, when it 
 
 **Stays:** `workflow_instance` / `workflow_step` as current state. `@Version`. `definition_version`. `attempt`. `idx_workflow_instance_status`.
 
-**Already added for later use:** `next_attempt_at`, `RetryPolicy` on `StepDefinition`.
+**Already added:** `next_attempt_at`, `deadline_at`, `RetryPolicy` and `timeout` on `StepDefinition`.
 
-**Planned tables/states, not present now:** `workflow_event` (audit/UI), outbox (if persist-then-publish drops publishes), `COMPENSATING` / `COMPENSATED` / `CANCELED` / `TIMED_OUT`, worker-side idempotency keys.
+**Planned tables/states, not present now:** `workflow_event` (audit/UI), outbox (if persist-then-publish drops publishes), `COMPENSATING` / `COMPENSATED` / `CANCELED` / a distinct `TIMED_OUT` status, worker-side idempotency keys.
 
 ### Picture
 
 ```
-Now (Phase 2)
+Now (Phase 3)
   Client → Engine HTTP → admit commit → workflow-* thread → stub.execute → complete/fail commit
-                         ↘ crash leftover → RecoveryScanner → same thread pool → stub.execute again
+                         ↘ deadline_at due → TimeoutPoller → FAILED / TIMED_OUT (late complete discarded)
+                         ↘ crash leftover still inside deadline → RecoveryScanner → stub.execute again
+                         ↘ crash leftover past deadline → FAILED / TIMED_OUT, no second invoke
 
 End goal (Phase 5–9, still current-state)
   Client → Engine HTTP → admit commit
@@ -523,9 +570,11 @@ spring.flyway.enabled: true
 management.endpoints.web.exposure.include: health
 workflow.recovery.enabled: true
 workflow.recovery.interval-ms: 2000
+workflow.timeout.enabled: true
+workflow.timeout.interval-ms: 2000
 ```
 
-Set `workflow.recovery.enabled=false` only in tests that plant leftovers before a second process should resume them.
+Set `workflow.recovery.enabled=false` only in tests that plant leftovers before a second process should resume them. `workflow.timeout.enabled=false` stops the poller only; a running-resume of an already-due step still writes `TIMED_OUT`.
 
 ---
 
@@ -547,6 +596,7 @@ Testcontainers starts its own `postgres:16`. You do not need Compose for tests.
 | `WorkflowExecutionTest` | Version 10, `failAt`, concurrent admit, blocked-stub admit snapshot |
 | `WorkflowDurabilityTest` | Second connection sees `RUNNING`; new context re-invokes (Phase 2) |
 | `WorkflowRecoveryTest` | Never-started `PENDING` completes; `FAILED` not retried |
+| `WorkflowTimeoutTest` | Due deadline → `FAILED` / `TIMED_OUT`; late success discarded; restart does not re-invoke |
 | `WorkflowPersistenceTest` | Flyway v2, unique keys, `@Version` starts at 0 |
 | `BodySizeFilterTest` | 64 KB cap without Spring |
 | `WorkflowExecutorPackageTest` | Executor bytecode does not name the stub package |
@@ -560,9 +610,9 @@ Manual leftover checks (SQL plant + restart) are described in the Phase 2 PR dis
 | Phase | Status | Focus |
 |---|---|---|
 | 1 | Done | Admit-then-run, stubs, REST, commit-before-invoke, no resume |
-| 2 | Done (this branch / PR-05) | Scanner, `RUNNING` re-invoke, `FAILED` left alone, retry policy + `next_attempt_at` |
-| 3 | Next | Timeout poller (durable time in Postgres) |
-| 4 | Optional | Harden `Activity` as the worker contract |
+| 2 | Done | Scanner, `RUNNING` re-invoke, `FAILED` left alone, retry policy + `next_attempt_at` |
+| 3 | Done | Timeout poller: `deadline_at`, `FAILED` / `TIMED_OUT`, late completion discarded |
+| 4 | Optional, next if the worker seam is still sloppy | Harden `Activity` as the worker contract |
 | 5 | Planned | Kafka + **one** worker process (needs the Phase 2 scanner to republish stale `RUNNING`) |
 | 6 | Planned | Activity idempotency (required before real side effects) |
 | 7+ | Planned | Compensation, optional worker split, multi-instance engine, signals, observability |

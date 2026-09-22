@@ -15,6 +15,7 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 
@@ -22,8 +23,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * Flyway V1 plus JPA: five steps, unique idempotency key, unique position,
- * {@code @Version} starts at 0. No executor and no REST.
+ * Flyway through V3 plus JPA: five steps, unique idempotency key, unique position,
+ * {@code @Version} starts at 0, {@code deadline_at} round-trips. No executor and no REST.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE)
 @Testcontainers
@@ -57,7 +58,7 @@ class WorkflowPersistenceTest {
 
     @Test
     void persistsInstanceWithFiveStepsAndReloads() {
-        assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("2");
+        assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("3");
 
         String idempotencyKey = "order-" + UUID.randomUUID();
         WorkflowInstanceEntity saved = persistOrderInstance(idempotencyKey);
@@ -116,6 +117,18 @@ class WorkflowPersistenceTest {
 
         assertThatThrownBy(() -> persistOrderInstance(idempotencyKey))
                 .isInstanceOf(DataIntegrityViolationException.class);
+    }
+
+    @Test
+    void deadlineAtRoundTripsThroughPostgres() {
+        WorkflowInstanceEntity saved = persistOrderInstance("deadline-" + UUID.randomUUID());
+        Instant deadline = Instant.parse("2026-01-01T00:05:00Z");
+        WorkflowStepEntity step = saved.getSteps().getFirst();
+        step.setDeadlineAt(deadline);
+        stepRepository.saveAndFlush(step);
+
+        WorkflowStepEntity reloaded = stepRepository.findById(step.getId()).orElseThrow();
+        assertThat(reloaded.getDeadlineAt()).isEqualTo(deadline);
     }
 
     @Test

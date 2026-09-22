@@ -28,7 +28,7 @@ Honesty labels used in `docs/architecture.md`:
 - **Planned** — later increment. Do not start unless the user asked for that phase.
 - **Theoretical** — vocabulary only. Not committed.
 
-Current code is Phase 2 (PR-05): leftover scanner resumes never-started `PENDING` and due `RUNNING` steps. `FAILED` is not retried. Next planned increment is Phase 3 / PR-06 (timeout poller). Do not scaffold Kafka, worker modules, compensation, signals, or a designer "for later".
+Current code is Phase 3 (PR-06): a poller fails a `RUNNING` step whose `deadline_at` is due (`FAILED`, error `TIMED_OUT`). Expired leftovers are not re-invoked. `FAILED` is not retried. Next planned increment is Phase 4 (optional `Activity` contract hardening) or Phase 5 (Kafka and one worker) when that phase is requested. Do not scaffold Kafka, worker modules, compensation, signals, timer steps, or a designer "for later".
 
 ---
 
@@ -76,7 +76,7 @@ A future `worker` module must depend on `engine-api` only, never on `engine`.
 | `com.workflowengine.domain` / `definition` | Workflow/step definitions and registry |
 | `com.workflowengine.activity` | `ActivityInvoker`, in-process invoker, registry |
 | `com.workflowengine.activity.stub` | Demo adapters. Not business services. |
-| `com.workflowengine.runtime` | `WorkflowExecutor` |
+| `com.workflowengine.runtime` | `WorkflowExecutor`, `RecoveryScanner`, `TimeoutPoller` |
 | `com.workflowengine.persistence` | Entities, Spring Data, Flyway-aligned mapping |
 | `com.workflowengine.config` | Boot configuration beans |
 
@@ -123,8 +123,17 @@ After a committed `RUNNING` write, invoke. On process death the **recovery scann
 | Leftover | Phase 2 |
 |---|---|
 | Instance `PENDING`, all steps `PENDING` | Resume: start the first step |
-| Instance `RUNNING`, one step `RUNNING` | Resume: re-invoke that step (`attempt++`) when `next_attempt_at` is due |
-| Instance `FAILED` | Leave terminal. Do not retry. |
+| Instance `RUNNING`, one step `RUNNING`, deadline still in the future | Resume: re-invoke that step (`attempt++`) when `next_attempt_at` is due, and refresh `deadline_at` |
+| Instance `RUNNING`, `deadline_at` due | Phase 3: step-fail with error `TIMED_OUT`. Do not increment `attempt`. Do not invoke. |
+| Instance `FAILED` | Leave terminal. Do not retry. Timeout uses this status; there is no `TIMED_OUT` enum value. |
+
+### Step timeout (Phase 3)
+
+- `StepDefinition.timeout` is a per-attempt limit. Null means no deadline. `ORDER` uses `OrderWorkflowDefinition.STEP_TIMEOUT` (5 minutes).
+- Step-start and running-resume set `workflow_step.deadline_at` from the engine `Clock`. `started_at` stays PostgreSQL `now()`.
+- `TimeoutPoller` writes the step-fail transaction. It does not submit `WorkflowDispatcher`, because the inflight set would hide an attempt that is still inside `execute`.
+- Do not interrupt the activity thread. If it returns after the timeout commit, discard the completion or activity failure. Do not continue to the next step.
+- A due deadline wins over running-resume and over `RETRY_EXHAUSTED`.
 
 Same-process double-submit is prevented by `WorkflowDispatcher`'s inflight set. `RetryPolicy.maxAttempts` caps `RUNNING` resumes; exceeding it writes `RETRY_EXHAUSTED` and `FAILED`.
 
@@ -197,7 +206,7 @@ Error bodies are generic (`Bad Request`, `Not Found`, `Payload Too Large`, `Serv
 - JSON payloads are `JSONB`. Timestamps are `TIMESTAMPTZ`, assigned by PostgreSQL. Map with Hibernate `@Generated` / `insertable=false, updatable=false`. Tests must not assert equality with `Instant.now()` from the JVM.
 - Step order is `workflow_step.position`. Names are not an order. Do not `ORDER BY started_at`.
 - Do not add `workflow_event` until a phase that reads it.
-- Do not add `CANCELED` / `TIMED_OUT` / `COMPENSATING` columns or check constraints until that phase.
+- Do not add `CANCELED` / `TIMED_OUT` / `COMPENSATING` status values or check constraints until a phase branches on that status. Phase 3 records timeouts as `FAILED` with error `TIMED_OUT` and column `deadline_at`.
 - Schema PRs after Phase 1 are expand/contract if rows exist that matter.
 
 New migrations: `V{n}__{snake_description}.sql`. Never edit an applied `V1__init.sql` once this database has been used beyond a disposable laptop drop.
@@ -369,7 +378,8 @@ No Prometheus, Jaeger, ELK, or Zipkin in Compose until Phase 11.
 - `201` tests must pin the **admit snapshot**: `PENDING`, `version=0`, `currentStep=null`, all steps `PENDING`. Prove it with a blocked first stub while POST returns.
 - Poll `GET` (or repository load) until terminal with a ~5s timeout. Happy path: five `COMPLETED` in position order, `attempt = 1`, `version = 10`, `currentStep = SEND_NOTIFICATION`, instance output equals last step output.
 - `failAt=PROCESS_PAYMENT` and `failAt=CREATE_ORDER` plus unknown `failAt` are required scenarios when changing the executor or stubs.
-- Durability / recovery: block inside `execute`; a **second DB connection** must see `RUNNING`. A **new** Spring context against the same database must re-invoke (`attempt++`). Inserting a `RUNNING` row by hand is not a substitute. A `FAILED` instance must not be retried after restart.
+- Durability / recovery: block inside `execute`; a **second DB connection** must see `RUNNING`. A **new** Spring context against the same database must re-invoke (`attempt++`) when the deadline is still in the future. Inserting a `RUNNING` row by hand is not a substitute. A `FAILED` instance must not be retried after restart.
+- Timeout: move the engine `Clock` (do not `Thread.sleep` for the deadline). An in-flight step past `deadline_at` becomes `FAILED` with error `TIMED_OUT` and a late success must not overwrite it. A restarted process past `deadline_at` must not invoke again.
 - Concurrent admit with the same key: one instance, one executor submit. Test the unique-violation path, not only sequential SELECT-then-INSERT.
 - Idempotent `200` must not submit a second executor.
 - HTTP: unknown type / missing key → `400`; unknown id → `404`; body `> 64 KB` → `413`.

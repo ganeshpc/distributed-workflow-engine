@@ -4,9 +4,9 @@
 |---|---|
 | **Author** | Engineering |
 | **Date** | 2026-09-13 |
-| **Status** | Draft |
+| **Status** | Draft. Phases 1–3 are implemented. Later phases stay Planned. Where an early section still says Phase 1 is the next slice, [Incremental Roadmap](#incremental-roadmap) is the status to follow. |
 | **Type** | Architecture + incremental implementation plan |
-| **Code in this revision** | None. This document is approved before any Maven module, Java source, compose file, or test is written. |
+| **Code in this revision** | The original review draft contained no code. The repository now contains Phases 1–3. |
 
 Honesty labels used throughout:
 
@@ -121,7 +121,8 @@ These are decided. They are not open questions. Phase 1 implementation forks tha
 | Wait-for-terminal on POST | **Not** in the Phase 1 API | A `?wait=true` flag would ossify "POST is complete" and is unnecessary once the id is in the `201`. Curl uses `POST` then `GET`. |
 | Units of work | **Commit-before-invoke.** Activity `execute` is never inside an open workflow transaction. See [Units of work](#units-of-work-phase-1). | A single `@Transactional` around start+run rolls back `RUNNING` on crash and falsifies the Phase 1 guarantee. |
 | Crash mid-step (Phase 1) | After a committed `RUNNING` write, invoke. On restart, leave it `RUNNING`. Do **not** auto-resume. Do **not** start the executor on idempotent `200`. | Phase 1 contract. |
-| Crash leftovers (Phase 2) | Scanner resumes never-started `PENDING` and due `RUNNING` (`attempt++`). `FAILED` is not retried. Idempotent `200` still does not submit. | At-least-once steps; stubs remain non-idempotent. |
+| Crash leftovers (Phase 2) | Scanner resumes never-started `PENDING` and due `RUNNING` (`attempt++`) while `deadline_at` is still in the future. `FAILED` is not retried. Idempotent `200` still does not submit. | At-least-once steps; stubs remain non-idempotent. |
+| Step timeout (Phase 3) | Per-attempt `deadline_at` from the engine `Clock` plus `StepDefinition.timeout`. Poller writes step and instance `FAILED` with error `TIMED_OUT`. No new status enum. Late success is discarded. An expired leftover is not re-invoked. | Durable time is a row plus a clock. `ORDER` uses 5 minutes. Distinct `TIMED_OUT` status stays planned until a phase branches on it. Not a timer step. |
 | Version column | Integer `version` on `workflow_instance`, mapped as JPA **`@Version` only** | Do **not** also write `version = version + 1` in custom SQL. One increment per instance-touching transaction. Happy-path terminal `version = 10` (see transition table). |
 | Step order | `workflow_step.position INT NOT NULL` + `UNIQUE (workflow_instance_id, position)` | Names are not an order. `ORDER BY started_at` fails for `PENDING` tails. |
 | Inter-step I/O | Every activity receives `workflowInputJson` re-serialized from the instance `input_json` row (same JSON **value** for every step). `stepInputJson` is **null**. Engine does **not** chain `output_json`. | JSONB will not preserve request whitespace/key order. Chaining is a later product decision. |
@@ -595,6 +596,13 @@ There is **no** `idx_workflow_step_instance`. `UNIQUE (workflow_instance_id, nam
 
 `idempotency_key` is `NOT NULL` with a full unique index. Phase 1 does not allow key-less instances, so a partial unique index is unnecessary.
 
+#### Later columns (expand-only)
+
+| Migration | Column | Who writes it |
+|---|---|---|
+| `V2__step_next_attempt_at.sql` | `workflow_step.next_attempt_at` | Engine `Clock` on running-resume when backoff is non-zero. Null means due now. |
+| `V3__step_deadline_at.sql` | `workflow_step.deadline_at` | Engine `Clock` on step-start and running-resume. Null means no timeout, including rows that were already `RUNNING` when the column was added. The Phase 3 poller reads it. |
+
 #### Why these columns exist now
 
 | Column | Phase 1 use | Why not later |
@@ -644,7 +652,7 @@ Do not add `CANCELED` / `TIMED_OUT` until a phase implements the transition.
 
 ### Order definition (**Phase 1**)
 
-Java, not JSON. Version 1 is linear. Retry/timeout policy fields on `StepDefinition` are omitted until Phase 2/3.
+Java, not JSON. Version 1 is linear. Retry policy is Phase 2. Timeout is Phase 3: `StepDefinition.timeout` plus `workflow_step.deadline_at`. `ORDER` uses 5 minutes per attempt. A null timeout means no deadline.
 
 ```java
 public final class OrderWorkflowDefinition implements WorkflowDefinition {
@@ -772,6 +780,7 @@ Demo-only. Each stub: if the workflow input JSON has `"failAt":"<this stub's nam
 |---|---|---|---|---|---|
 | **Phase 1** | One engine process (many Tomcat threads) | Postgres | In-process, **after** each `RUNNING` commit, on a `TaskExecutor` thread | Required key; unique violation → reload → `200`; only INSERT winner starts executor | Crash mid-step leaves committed `RUNNING`; no resume |
 | **Phase 2** | One engine process | Postgres | In-process; recovery may re-invoke `RUNNING` steps and start `PENDING` instances | Same | At-least-once steps; stubs still non-idempotent (documented). Terminal `FAILED` is **not** retried until a retry policy exists. |
+| **Phase 3** | One engine process | Postgres | In-process. A poller may fail a `RUNNING` step while `execute` is still on the executor thread | Same | Due `deadline_at` → `FAILED` with error `TIMED_OUT`. Not retried. Late completion is discarded. |
 | **Phase 5** | Engine + one worker | Postgres (orchestration), Kafka (transport) | Async, at-least-once delivery | Same | Lost messages recovered by scanner; **Planned** outbox if persist-then-publish drops a publish |
 | **Phase 6** | Same | Same | Worker idempotency on `(workflowId, step, attempt)` | Same | Effectively-once *business* effects |
 | **Phase 9** | N engines | Postgres | Workers only; engines never run stubs | Same + row claim | `@Version` + `SKIP LOCKED` become load-bearing |
@@ -887,12 +896,13 @@ If the first request won the INSERT, it may also have submitted the executor bef
 - A failed workflow stays failed.
 - We will **not** automatically continue or retry. Startup does not scan. Idempotent `200` does not start the executor.
 
-### Leftovers the Phase 2 scanner resumes
+### Leftovers recovery and the timeout poller act on
 
-| Leftover | How it happens | Phase 1 | Phase 2 |
+| Leftover | How it happens | Phase 1 | Phase 2 / 3 |
 |---|---|---|---|
 | Instance `PENDING`, all steps `PENDING` | Crash after admit before first step-start, submit lost, or executor-thread infra failure before first step-start | Stuck in Phase 1 | **Resume:** start first step |
-| Instance `RUNNING`, one step `RUNNING`, earlier `COMPLETED`, later `PENDING` | Crash during invoke after `RUNNING` commit, or executor-thread infra failure after that commit | Stuck in Phase 1 | **Resume:** re-invoke that `RUNNING` step (`attempt++`) |
+| Instance `RUNNING`, one step `RUNNING`, earlier `COMPLETED`, later `PENDING`, deadline still in the future | Crash during invoke after `RUNNING` commit, or executor-thread infra failure after that commit | Stuck in Phase 1 | **Resume:** re-invoke that `RUNNING` step (`attempt++`) and refresh `deadline_at` |
+| Instance `RUNNING`, one step `RUNNING`, `deadline_at` due | Attempt exceeded its timeout, including a crash that outlived the deadline | Not in Phase 1 | **Fail:** step and instance `FAILED`, error `TIMED_OUT`. Do not increment `attempt`. Do not invoke |
 | Instance `FAILED`, some `COMPLETED`, one `FAILED`, rest `PENDING` | `failAt` or stub failure | Terminal | **Do not retry** (policy exists for `RUNNING` leftovers only) |
 | Instance `RUNNING`, all steps `COMPLETED` | Must **not** occur if workflow-complete is one transaction | Not an expected leftover | N/A if Phase 1 holds the one-transaction rule |
 
@@ -1042,7 +1052,7 @@ Each phase is a meaningful, testable increment. Nothing below Phase 1 is include
 
 No code. Approve or revise this doc.
 
-### Phase 1 — Durable linear orchestrator (**next**)
+### Phase 1 — Durable linear orchestrator (**implemented**)
 
 Admit-then-run, in-process stubs, REST start/get, Postgres, Flyway, Testcontainers, commit-before-invoke, restart *as data*. See [First Milestone](#first-milestone-acceptance-criteria-phase-1).
 
@@ -1061,14 +1071,23 @@ Concepts: state machine, SoT, committed visibility, idempotent admission, optimi
 
 Concepts: at-least-once, poison (retry cap), backoff.
 
-### Phase 3 — Timeout poller (**Planned**)
+### Phase 3 — Timeout poller (**implemented**, PR-06)
 
-- Step timeout policy on the definition.
-- Periodic poller (same JVM) marks exceeded `RUNNING` steps failed-by-timeout (`FAILED` or a later `TIMED_OUT` value added then).
-- Still no Kafka. Spring `@Scheduled` against Postgres is enough.
-- This is **not** "first-class timer steps." Those are Phase 10.
+Step timeout is a per-attempt deadline. It is not a timer step. Timer steps stay Phase 10.
 
-Concepts: durable time as *rows + a clock*, not `Thread.sleep`.
+- `StepDefinition.timeout` is a `Duration`. Null means the step never times out. Negative is rejected. Zero is already due at step-start.
+- `ORDER` sets every step to 5 minutes (`OrderWorkflowDefinition.STEP_TIMEOUT`).
+- The step-start transaction and the running-resume transaction set `workflow_step.deadline_at` to `Clock.instant()` plus that timeout. The column uses the engine clock, not PostgreSQL `now()`. `started_at` stays the database clock and is not the timeout authority. Running-resume refreshes the deadline so each attempt gets a full window.
+- `TimeoutPoller` (same JVM, startup and `workflow.timeout.interval-ms`) loads `RUNNING` instances. A `RUNNING` step whose `deadline_at` is due (`<=` the clock) is committed with the step-fail transaction: step and instance `FAILED`, error text `TIMED_OUT`, `attempt` unchanged, later steps `PENDING`, instance `output_json` null. The activity is not invoked.
+- The poller writes that transaction itself. It does not call `WorkflowDispatcher`. The inflight set would hide a workflow whose invoke is still on a `workflow-*` thread.
+- The in-flight invoke is not interrupted. When it returns, a completion or activity-failure write is discarded if the step is no longer `RUNNING`. A `@Version` conflict on that race is an executor-thread infrastructure failure: log and stop. The committed winner stands.
+- The recovery scanner does not submit a leftover whose `deadline_at` is already due. The poller fails it. If a submit is already queued and the deadline elapses before running-resume, that resume writes the same `TIMED_OUT` failure and does not invoke. Timeout wins over another attempt and over `RETRY_EXHAUSTED`.
+- `FAILED` with error `TIMED_OUT` is terminal. The recovery scanner does not select `FAILED`. There is no `TIMED_OUT` enum value and no check-constraint change.
+- Tests move a controllable `Clock`. They do not sleep for the timeout and do not compare `deadline_at` to `Instant.now()`.
+
+Concepts: durable time as rows plus a clock.
+
+Phase 5 result application keeps the discard rule: a late result for a step that is no longer `RUNNING` does not overwrite `FAILED`.
 
 ### Phase 4 — Harden the worker port (**Planned**)
 
@@ -1426,12 +1445,12 @@ Do not open a PR that scaffolds unused worker services, Kafka, or a designer.
 - **Depends on:** PR-04 (Phase 1 accepted)
 - **Description:** Makes at-least-once operational for the leftovers named in Phase 1. Does not add Kafka or worker idempotency.
 
-### PR-06 — Timeout poller (**Phase 3**)
+### PR-06 — Timeout poller (**Phase 3**, **implemented**)
 
 - **Title:** Step timeouts via Postgres-backed poller
-- **Files/components:** timeout field on definition; poller; tests with a controllable clock
+- **Files/components:** `StepDefinition.timeout`; `V3` `deadline_at`; `TimeoutPoller`; discard of a late completion; tests with a controllable clock
 - **Depends on:** PR-05
-- **Description:** Durable time. Still one process. Not timer steps.
+- **Description:** Durable time. Still one process. Not timer steps. Status stays `FAILED` with error `TIMED_OUT`.
 
 ### PR-07 — Invoker / Activity contract hardening (**Phase 4**, skip if redundant)
 

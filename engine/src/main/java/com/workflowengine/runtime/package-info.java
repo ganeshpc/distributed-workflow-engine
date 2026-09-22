@@ -10,7 +10,10 @@
  *
  * <p>A <strong>leftover</strong> is committed state left after a crash:
  * never-started {@code PENDING}, or a {@code RUNNING} step mid-invoke. Phase 2
- * {@link com.workflowengine.runtime.RecoveryScanner} resumes those.
+ * {@link com.workflowengine.runtime.RecoveryScanner} resumes those when the
+ * step's deadline is still in the future. Phase 3
+ * {@link com.workflowengine.runtime.TimeoutPoller} marks a due
+ * {@code RUNNING} step {@code FAILED} with error {@code TIMED_OUT}.
  * {@code FAILED} stays terminal.
  */
 package com.workflowengine.runtime;

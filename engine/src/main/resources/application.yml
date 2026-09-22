@@ -22,6 +22,9 @@ workflow:
   recovery:
     enabled: true
     interval-ms: 2000
+  timeout:
+    enabled: true
+    interval-ms: 2000
 
 springdoc:
   paths-to-match: /api/**

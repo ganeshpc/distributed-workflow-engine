@@ -36,9 +36,16 @@ The design contract is [`docs/architecture.md`](docs/architecture.md). Agent rul
 **Prerequisites:** Java 21, Maven 3.9+, Docker.
 
 ```text
-docker compose up -d
-# wait until postgres is healthy: docker compose ps
+docker compose up -d --build
+# builds the engine and worker images, then starts Postgres, Kafka, and both processes
+```
 
+`http://localhost:8080` is the engine. Inside Compose the engine uses `postgres:5432` and the worker and engine use Kafka at `kafka:19092` (the broker's in-network listener). Host tools still use `localhost:9092`.
+
+To run the processes on the host instead, start only the infrastructure and point the apps at localhost:
+
+```text
+docker compose up -d postgres kafka
 mvn -pl engine -am spring-boot:run
 # second terminal
 mvn -pl worker -am spring-boot:run

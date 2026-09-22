@@ -1339,9 +1339,8 @@ This is the implementation gate. If a PR adds anything not listed, it is out of 
 ### Local run sketch (to be copied into README with the code)
 
 ```text
-docker compose up -d
-# wait for postgres healthy
-mvn -pl engine -am spring-boot:run
+docker compose up -d --build
+# Postgres, Kafka, engine, and worker. Engine is on http://localhost:8080.
 
 curl -sD - -X POST http://localhost:8080/api/v1/workflows \
   -H 'Content-Type: application/json' \

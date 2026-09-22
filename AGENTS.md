@@ -42,7 +42,7 @@ Current code is Phase 5 (PR-08): the engine commits `RUNNING`, publishes `activi
 | Persistence | PostgreSQL 16, Flyway SQL, Spring Data JPA |
 | API | REST JSON under `/api/v1` |
 | Tests | JUnit Jupiter (managed JUnit 6), AssertJ, Spring Boot Test, Testcontainers 2 PostgreSQL |
-| Local infra | `docker-compose.yml` — Postgres only |
+| Local infra | `docker-compose.yml` — Postgres, Kafka, engine, and worker |
 
 Do not add Spring Statemachine, Kafka, Redis, Elasticsearch, gRPC, Micrometer dashboards, or extra Compose services unless the matching phase is in progress.
 
@@ -390,10 +390,11 @@ Run `mvn test` before considering work done. There is no CI requirement in Phase
 ## Local run
 
 ```text
-docker compose up -d
-# wait until postgres is healthy
-mvn -pl engine -am spring-boot:run
+docker compose up -d --build
+# Postgres, Kafka, engine on 127.0.0.1:8080, and the worker
 ```
+
+Host-side `mvn spring-boot:run` stays available: `docker compose up -d postgres kafka`, then run `engine` and `worker` on the laptop. Those processes use `localhost:5432` and `localhost:9092`. Containers use `postgres:5432` and `kafka:19092`.
 
 Health: `curl -s http://localhost:8080/actuator/health` → `{"status":"UP"}`.
 

@@ -1,4 +1,4 @@
-package com.workflowengine.activity.stub;
+package com.workflowengine.worker.activity;
 
 import com.workflowengine.api.activity.Activity;
 import com.workflowengine.api.activity.ActivityContext;
@@ -6,16 +6,16 @@ import com.workflowengine.api.activity.ActivityResult;
 import org.springframework.stereotype.Component;
 
 /**
- * In-process stub for {@code CREATE_ORDER}. No order table; canned JSON only.
+ * In-process stub for {@code SEND_NOTIFICATION}. No mailer; canned JSON only.
  *
- * <p>Spring singleton invoked from {@code workflow-*} threads. Honors
- * {@code failAt} and {@link ActivityBlockHook} via {@link StubSupport}.
+ * <p>Last step of the linear ORDER saga. Its output is copied onto the
+ * instance when the workflow-complete transaction commits {@code COMPLETED}.
  */
 @Component
-public class CreateOrderActivity implements Activity {
+public class SendNotificationActivity implements Activity {
 
     /** Step name this stub registers as. */
-    public static final String NAME = "CREATE_ORDER";
+    public static final String NAME = "SEND_NOTIFICATION";
 
     @Override
     public String name() {

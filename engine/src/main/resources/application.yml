@@ -11,6 +11,17 @@ spring:
       ddl-auto: none
   flyway:
     enabled: true
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: workflow-engine-results
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
 
 management:
   endpoints:
@@ -25,6 +36,10 @@ workflow:
   timeout:
     enabled: true
     interval-ms: 2000
+  dispatch:
+    tasks-topic: activity.tasks
+    results-topic: activity.results
+    republish-after-ms: 30000
 
 springdoc:
   paths-to-match: /api/**

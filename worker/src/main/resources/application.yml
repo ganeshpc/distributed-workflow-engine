@@ -1,0 +1,19 @@
+spring:
+  main:
+    web-application-type: none
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: workflow-worker-tasks
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+
+workflow:
+  dispatch:
+    tasks-topic: activity.tasks
+    results-topic: activity.results

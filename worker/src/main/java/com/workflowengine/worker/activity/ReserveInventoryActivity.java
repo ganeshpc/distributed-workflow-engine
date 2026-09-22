@@ -1,4 +1,4 @@
-package com.workflowengine.activity.stub;
+package com.workflowengine.worker.activity;
 
 import com.workflowengine.api.activity.Activity;
 import com.workflowengine.api.activity.ActivityContext;
@@ -6,15 +6,15 @@ import com.workflowengine.api.activity.ActivityResult;
 import org.springframework.stereotype.Component;
 
 /**
- * In-process stub for {@code CREATE_SHIPMENT}. No carrier; canned JSON only.
+ * In-process stub for {@code RESERVE_INVENTORY}. No inventory table; canned JSON only.
  *
  * <p>Spring singleton invoked from {@code workflow-*} threads.
  */
 @Component
-public class CreateShipmentActivity implements Activity {
+public class ReserveInventoryActivity implements Activity {
 
     /** Step name this stub registers as. */
-    public static final String NAME = "CREATE_SHIPMENT";
+    public static final String NAME = "RESERVE_INVENTORY";
 
     @Override
     public String name() {

@@ -1,11 +1,10 @@
 package com.workflowengine.runtime;
 
-import com.workflowengine.activity.ActivityInvoker;
 import com.workflowengine.api.StepStatus;
 import com.workflowengine.api.WorkflowStatus;
+import com.workflowengine.api.activity.ActivityCompletion;
 import com.workflowengine.api.activity.ActivityContext;
 import com.workflowengine.api.activity.ActivityResult;
-import com.workflowengine.domain.RetryPolicy;
 import com.workflowengine.domain.StepDefinition;
 import com.workflowengine.domain.WorkflowDefinition;
 import com.workflowengine.domain.WorkflowDefinitionRegistry;
@@ -15,6 +14,8 @@ import com.workflowengine.persistence.WorkflowStepEntity;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.LockModeType;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -26,24 +27,28 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * Runs a linear ORDER saga with commit-before-invoke.
+ * Dispatches a linear ORDER saga: commit {@code RUNNING}, publish a task, return.
  *
- * <p>Each unit of work is its own committed transaction. {@link ActivityInvoker#invoke}
- * runs with no open workflow transaction. Instance {@code PENDING→RUNNING} is folded
- * into the first step-start transaction. Last-step {@code COMPLETED} and instance
- * {@code COMPLETED} share one workflow-complete transaction so a leftover of instance {@code RUNNING}
- * plus all steps {@code COMPLETED} cannot exist.
+ * <p>Each state change is its own committed transaction. Nothing in this class
+ * calls {@code Activity.execute}. The worker does that and
+ * {@link #onActivityResult} applies the completion later. Instance
+ * {@code PENDING→RUNNING} is folded into the first step-start transaction.
+ * Last-step {@code COMPLETED} and instance {@code COMPLETED} share one
+ * workflow-complete transaction.
  *
- * <p><strong>Leftovers:</strong> Phase 2 resumes never-started {@code PENDING} and due
- * {@code RUNNING} steps (attempt++) while {@code deadline_at} is still in the
- * future. {@code FAILED} stays terminal. A leftover {@code RUNNING} whose next
- * attempt would exceed {@link RetryPolicy#maxAttempts()} becomes poison
- * {@code RETRY_EXHAUSTED}. A due {@code deadline_at} becomes {@code FAILED}
- * with {@link #TIMED_OUT_ERROR} and is not re-invoked.
+ * <p><strong>Leftovers:</strong> a never-started {@code PENDING} admission
+ * starts the first step and publishes. A {@code RUNNING} step inside its
+ * deadline is republished with the same {@code attempt} once
+ * {@code next_attempt_at} is due. A due {@code deadline_at} becomes
+ * {@code FAILED} with {@link #TIMED_OUT_ERROR}. {@code FAILED} stays terminal.
+ * Republish does not increment {@code attempt}. The deadline bounds a lost
+ * result. A crash between a mid-step complete and the next step-start leaves
+ * instance {@code RUNNING} with a {@code PENDING} step and no {@code RUNNING}
+ * step; the next {@link #run} starts that step.
  *
- * <p>Runs on {@code workflow-*} threads, never the HTTP request thread.
+ * <p>Runs on {@code workflow-*} threads and on the result-listener thread.
  * {@link #timeoutIfDue} also runs on the scheduler thread. This class must not
- * import the in-process stub package. Infrastructure failures are logged and
+ * import the worker stub package. Infrastructure failures are logged and
  * stop the run; they do not mark the step {@code FAILED}. A completion that
  * arrives after a timeout is discarded.
  *
@@ -64,10 +69,11 @@ public class WorkflowExecutor {
 
     private final WorkflowInstanceRepository instances;
     private final WorkflowDefinitionRegistry definitions;
-    private final ActivityInvoker invoker;
+    private final TaskPublisher publisher;
     private final TransactionTemplate tx;
     private final EntityManager entityManager;
     private final Clock clock;
+    private final Duration republishAfter;
 
     /**
      * Serializes {@link #timeoutIfDue} so the ready-event pass and the
@@ -80,25 +86,29 @@ public class WorkflowExecutor {
      *
      * @param instances instance repository
      * @param definitions type registry
-     * @param invoker sync activity port
+     * @param publisher task sender used only after the step-start transaction commits
      * @param transactionManager not used as a class-level {@code @Transactional}
      * @param entityManager used to force {@code @Version} bumps and stamp timestamps
-     * @param clock backoff due-time and step-deadline clock for {@code RUNNING} steps
+     * @param clock republish due-time and step-deadline clock
+     * @param republishAfterMs delay stored in {@code next_attempt_at} at step-start;
+     * zero means the scanner may republish immediately
      */
     public WorkflowExecutor(
             WorkflowInstanceRepository instances,
             WorkflowDefinitionRegistry definitions,
-            ActivityInvoker invoker,
+            TaskPublisher publisher,
             PlatformTransactionManager transactionManager,
             EntityManager entityManager,
-            Clock clock
+            Clock clock,
+            @Value("${workflow.dispatch.republish-after-ms:30000}") long republishAfterMs
     ) {
         this.instances = instances;
         this.definitions = definitions;
-        this.invoker = invoker;
+        this.publisher = publisher;
         this.tx = new TransactionTemplate(transactionManager);
         this.entityManager = entityManager;
         this.clock = clock;
+        this.republishAfter = Duration.ofMillis(Math.max(republishAfterMs, 0));
         this.timeoutStripes = new Object[TIMEOUT_STRIPES];
         for (int i = 0; i < TIMEOUT_STRIPES; i++) {
             this.timeoutStripes[i] = new Object();
@@ -122,60 +132,42 @@ public class WorkflowExecutor {
     }
 
     /**
-     * Walks definition steps: step-start, invoke, complete or fail.
+     * Applies one worker result, then starts the next step when the walk continues.
+     *
+     * <p>Called on the Kafka listener thread with no open workflow transaction.
+     * An optimistic-lock loss is logged and ignored. Any other persistence
+     * failure propagates so the broker can redeliver the result.
+     *
+     * @param completion decoded result; not null
+     */
+    public void onActivityResult(ActivityCompletion completion) {
+        Boolean continueWalk;
+        try {
+            continueWalk = tx.execute(status -> applyResult(completion));
+        } catch (OptimisticLockingFailureException ex) {
+            log.error("executor infrastructure failure workflowId={} reason=result",
+                    completion.workflowId(), ex);
+            return;
+        }
+        if (Boolean.TRUE.equals(continueWalk)) {
+            run(completion.workflowId());
+        }
+    }
+
+    /**
+     * Starts the next pending step or republishes the current {@code RUNNING}
+     * attempt, then publishes outside the transaction.
      *
      * @param workflowId instance id
      */
     private void execute(UUID workflowId) {
-        Seed seed = tx.execute(status -> loadSeed(workflowId));
-        if (seed == null) {
-            log.error("executor infrastructure failure workflowId={} reason=not_found", workflowId);
+        ActivityContext task = tx.execute(status -> choose(workflowId));
+        if (task == null) {
             return;
         }
-        WorkflowDefinition definition = definitions.findByType(seed.type()).orElse(null);
-        if (definition == null) {
-            log.error("executor infrastructure failure workflowId={} reason=unknown_type type={}",
-                    workflowId, seed.type());
-            return;
-        }
-
-        List<StepDefinition> steps = definition.steps();
-        for (int i = 0; i < steps.size(); i++) {
-            int position = i;
-            StepDefinition stepDef = steps.get(position);
-            Prepared prepared = tx.execute(status -> prepareStep(workflowId, position, stepDef));
-            if (prepared == null || prepared.kind() == Prepared.Kind.STOP) {
-                return;
-            }
-            if (prepared.kind() == Prepared.Kind.SKIP) {
-                continue;
-            }
-            int attempt = prepared.attempt();
-
-            ActivityResult result = invoker.invoke(new ActivityContext(
-                    workflowId,
-                    seed.type(),
-                    seed.definitionVersion(),
-                    stepDef.name(),
-                    attempt,
-                    seed.inputJson(),
-                    null
-            ));
-
-            boolean last = position == steps.size() - 1;
-            Boolean wrote = tx.execute(status -> {
-                if (!result.success()) {
-                    return failStep(workflowId, position, result);
-                }
-                if (last) {
-                    return completeLastStep(workflowId, position, result);
-                }
-                return completeMidStep(workflowId, position, result);
-            });
-            if (!result.success() || !Boolean.TRUE.equals(wrote)) {
-                return;
-            }
-        }
+        publisher.publish(task);
+        log.info("task published workflowId={} type={} step={} attempt={} status=RUNNING",
+                task.workflowId(), task.workflowType(), task.stepName(), task.attempt());
     }
 
     /**
@@ -227,52 +219,101 @@ public class WorkflowExecutor {
     }
 
     /**
-     * Reads type, definition version, and input once. Later steps reuse this
-     * so every activity sees the same workflow input JSON.
+     * Picks the one task to publish: start the next {@code PENDING} step, or
+     * republish a due {@code RUNNING} step without incrementing {@code attempt}.
      *
      * @param workflowId instance id
-     * @return seed, or null if the row is missing
+     * @return task to publish, or null when the walk should stop
      */
-    private Seed loadSeed(UUID workflowId) {
+    private ActivityContext choose(UUID workflowId) {
         WorkflowInstanceEntity instance = instances.findById(workflowId).orElse(null);
         if (instance == null) {
+            log.error("executor infrastructure failure workflowId={} reason=not_found", workflowId);
             return null;
         }
-        return new Seed(instance.getType(), instance.getDefinitionVersion(), instance.getInputJson());
+        if (instance.getStatus() == WorkflowStatus.COMPLETED
+                || instance.getStatus() == WorkflowStatus.FAILED) {
+            return null;
+        }
+        WorkflowDefinition definition = definitions.findByType(instance.getType()).orElse(null);
+        if (definition == null) {
+            log.error("executor infrastructure failure workflowId={} reason=unknown_type type={}",
+                    workflowId, instance.getType());
+            return null;
+        }
+        List<StepDefinition> steps = definition.steps();
+        for (int position = 0; position < steps.size(); position++) {
+            StepDefinition stepDef = steps.get(position);
+            WorkflowStepEntity step = stepAt(instance, position);
+            if (step.getStatus() == StepStatus.COMPLETED) {
+                continue;
+            }
+            if (step.getStatus() == StepStatus.FAILED) {
+                return null;
+            }
+            if (step.getStatus() == StepStatus.PENDING) {
+                int attempt = startStep(instance, step, stepDef.name(), stepDef.timeout());
+                return contextFor(instance, stepDef.name(), attempt);
+            }
+            return republishIfDue(instance, step);
+        }
+        return null;
     }
 
     /**
-     * Chooses skip (already {@code COMPLETED}), stop (terminal, not due, timed out, or poison),
-     * or run (step-start / leftover resume).
+     * Applies a result when the named step is still {@code RUNNING} at that attempt.
      *
-     * @param workflowId instance id
-     * @param position step index
-     * @param stepDef name, retry policy, and per-attempt timeout
-     * @return prepared action; never null
+     * @param completion worker outcome
+     * @return true when the mid-step complete committed and the next step should start
      */
-    private Prepared prepareStep(UUID workflowId, int position, StepDefinition stepDef) {
-        WorkflowInstanceEntity instance = instances.findById(workflowId).orElseThrow();
-        if (instance.getStatus() == WorkflowStatus.COMPLETED
-                || instance.getStatus() == WorkflowStatus.FAILED) {
-            return Prepared.stop();
+    private boolean applyResult(ActivityCompletion completion) {
+        WorkflowInstanceEntity instance = instances.findById(completion.workflowId()).orElse(null);
+        if (instance == null) {
+            log.error("executor infrastructure failure workflowId={} reason=not_found", completion.workflowId());
+            return false;
         }
-        WorkflowStepEntity step = stepAt(instance, position);
-        if (step.getStatus() == StepStatus.COMPLETED) {
-            return Prepared.skip();
+        WorkflowDefinition definition = definitions.findByType(instance.getType()).orElse(null);
+        if (definition == null) {
+            log.error("executor infrastructure failure workflowId={} reason=unknown_type type={}",
+                    completion.workflowId(), instance.getType());
+            return false;
         }
-        if (step.getStatus() == StepStatus.FAILED) {
-            return Prepared.stop();
+        WorkflowStepEntity step = instance.getSteps().stream()
+                .filter(candidate -> candidate.getName().equals(completion.stepName()))
+                .findFirst()
+                .orElse(null);
+        if (step == null) {
+            log.error("executor infrastructure failure workflowId={} reason=unknown_step step={}",
+                    completion.workflowId(), completion.stepName());
+            return false;
         }
-        if (step.getStatus() == StepStatus.PENDING) {
-            return Prepared.run(startStep(instance, step, stepDef.name(), stepDef.timeout()));
+        if (step.getStatus() != StepStatus.RUNNING
+                || instance.getStatus() != WorkflowStatus.RUNNING
+                || step.getAttempt() != completion.attempt()) {
+            log.info("step write skipped workflowId={} type={} step={} attempt={} status={} version={} reason=not_running",
+                    instance.getId(), instance.getType(), step.getName(), step.getAttempt(),
+                    step.getStatus(), instance.getVersion());
+            return false;
         }
-        return resumeRunning(instance, step, stepDef.retryPolicy(), stepDef.timeout());
+        ActivityResult result = new ActivityResult(
+                completion.success(), completion.outputJson(), completion.error());
+        boolean last = step.getPosition() == definition.steps().size() - 1;
+        if (!completion.success()) {
+            failStep(completion.workflowId(), step.getPosition(), result);
+            return false;
+        }
+        if (last) {
+            completeLastStep(completion.workflowId(), step.getPosition(), result);
+            return false;
+        }
+        return completeMidStep(completion.workflowId(), step.getPosition(), result);
     }
 
     /**
      * Step-start transaction: step {@code PENDING→RUNNING}, increment {@code attempt}, set
      * instance {@code RUNNING} and {@code current_step}, stamp {@code started_at}
-     * from the database and {@code deadline_at} from the engine clock.
+     * from the database, {@code deadline_at} from the engine clock, and
+     * {@code next_attempt_at} as the earliest republish time.
      *
      * @param instance loaded aggregate
      * @param step {@code PENDING} step
@@ -287,10 +328,11 @@ public class WorkflowExecutor {
             Duration timeout
     ) {
         int attempt = step.getAttempt() + 1;
+        Instant now = clock.instant();
         step.setStatus(StepStatus.RUNNING);
         step.setAttempt(attempt);
-        step.setNextAttemptAt(null);
-        step.setDeadlineAt(deadlineFor(clock.instant(), timeout));
+        step.setNextAttemptAt(republishAfter.isZero() ? null : now.plus(republishAfter));
+        step.setDeadlineAt(deadlineFor(now, timeout));
         instance.setStatus(WorkflowStatus.RUNNING);
         instance.setCurrentStep(stepName);
         stampStartedAt(step);
@@ -301,51 +343,47 @@ public class WorkflowExecutor {
     }
 
     /**
-     * Resume leftover {@code RUNNING}, or fail it when the deadline is due.
-     * A due deadline wins over backoff and over {@code RETRY_EXHAUSTED}:
-     * the attempt is not incremented and the activity is not invoked.
-     * Otherwise: not due yet → stop; next attempt above {@code maxAttempts}
-     * → poison {@code FAILED}; else increment {@code attempt}, refresh
-     * {@code deadline_at}, then invoke again.
+     * Republishes a leftover {@code RUNNING} step, or fails it when the deadline is due.
+     * The attempt is not incremented. A future {@code next_attempt_at} waits.
      *
      * @param instance loaded aggregate
      * @param step the {@code RUNNING} step
-     * @param retryPolicy attempt cap and backoff
-     * @param timeout per-attempt limit applied to the new attempt; null means no deadline
-     * @return run with the new attempt, or stop
+     * @return task for the current attempt, or null when nothing is published
      */
-    private Prepared resumeRunning(
-            WorkflowInstanceEntity instance,
-            WorkflowStepEntity step,
-            RetryPolicy retryPolicy,
-            Duration timeout
-    ) {
+    private ActivityContext republishIfDue(WorkflowInstanceEntity instance, WorkflowStepEntity step) {
         Instant now = clock.instant();
         if (deadlineDue(step.getDeadlineAt(), now)) {
             failStep(instance.getId(), step.getPosition(),
                     new ActivityResult(false, null, TIMED_OUT_ERROR));
-            return Prepared.stop();
+            return null;
         }
         Instant next = step.getNextAttemptAt();
         if (next != null && next.isAfter(now)) {
-            return Prepared.stop();
+            return null;
         }
-        int attempt = step.getAttempt() + 1;
-        if (attempt > retryPolicy.maxAttempts()) {
-            failStep(instance.getId(), step.getPosition(),
-                    new ActivityResult(false, null, "RETRY_EXHAUSTED"));
-            return Prepared.stop();
-        }
-        step.setAttempt(attempt);
-        step.setNextAttemptAt(retryPolicy.initialBackoff().isZero()
-                ? null
-                : now.plus(retryPolicy.initialBackoff()));
-        step.setDeadlineAt(deadlineFor(now, timeout));
-        entityManager.lock(instance, LockModeType.OPTIMISTIC_FORCE_INCREMENT);
+        log.info("task republish workflowId={} type={} step={} attempt={} status=RUNNING version={}",
+                instance.getId(), instance.getType(), step.getName(), step.getAttempt(), instance.getVersion());
+        return contextFor(instance, step.getName(), step.getAttempt());
+    }
 
-        log.info("step resumed workflowId={} type={} step={} attempt={} status=RUNNING version={}",
-                instance.getId(), instance.getType(), step.getName(), attempt, instance.getVersion());
-        return Prepared.run(attempt);
+    /**
+     * Builds the task body from the instance row so every step sees the same input.
+     *
+     * @param instance loaded aggregate
+     * @param stepName activity name
+     * @param attempt attempt stored on the step
+     * @return context with null step input
+     */
+    private static ActivityContext contextFor(WorkflowInstanceEntity instance, String stepName, int attempt) {
+        return new ActivityContext(
+                instance.getId(),
+                instance.getType(),
+                instance.getDefinitionVersion(),
+                stepName,
+                attempt,
+                instance.getInputJson(),
+                null
+        );
     }
 
     /**
@@ -535,43 +573,5 @@ public class WorkflowExecutor {
                 .filter(step -> step.getPosition() == position)
                 .findFirst()
                 .orElseThrow(() -> new IllegalStateException("missing step at position " + position));
-    }
-
-    /**
-     * Values reused for every {@link ActivityContext} so step input is not chained.
-     *
-     * @param type workflow type
-     * @param definitionVersion version stored at admit
-     * @param inputJson workflow input JSON text
-     */
-    private record Seed(String type, int definitionVersion, String inputJson) {
-    }
-
-    /**
-     * Result of {@link #prepareStep}. {@code SKIP} continues the definition walk;
-     * {@code STOP} ends the run; {@code RUN} invokes with {@code attempt}.
-     *
-     * @param kind what the executor should do next
-     * @param attempt current attempt when {@code kind} is {@code RUN}; otherwise null
-     */
-    private record Prepared(Kind kind, Integer attempt) {
-
-        enum Kind {
-            STOP,
-            SKIP,
-            RUN
-        }
-
-        static Prepared stop() {
-            return new Prepared(Kind.STOP, null);
-        }
-
-        static Prepared skip() {
-            return new Prepared(Kind.SKIP, null);
-        }
-
-        static Prepared run(int attempt) {
-            return new Prepared(Kind.RUN, attempt);
-        }
     }
 }

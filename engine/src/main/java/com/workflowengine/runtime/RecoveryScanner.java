@@ -26,13 +26,12 @@ import java.util.List;
  * crash. Same-process duplicates are filtered by {@link WorkflowDispatcher}.
  *
  * <p>Runs on the scheduler thread (and once at {@link ApplicationReadyEvent}).
- * Submit is asynchronous. A {@code RUNNING} step with {@code next_attempt_at}
- * in the future is left for a later pass (backoff). A step whose
- * {@code deadline_at} is already due is not submitted. {@link TimeoutPoller}
- * fails that attempt. An invoke that is already in flight in this process is
- * not submitted twice; the poller does not use the dispatcher, so it can still
- * fail the in-flight row. If a submit races and the deadline elapses before
- * resume, {@link WorkflowExecutor} writes {@code TIMED_OUT} instead of invoking.
+ * Submit is asynchronous. {@link WorkflowExecutor} publishes a task; it does
+ * not call the activity. A {@code RUNNING} step is republished at the same
+ * attempt once {@code next_attempt_at} is due. A due {@code deadline_at} is
+ * not submitted; {@link TimeoutPoller} fails it. An instance {@code RUNNING}
+ * with no {@code RUNNING} step and a later {@code PENDING} step is submitted
+ * so a crash between complete and the next step-start can continue.
  */
 @Slf4j
 @Component
@@ -107,6 +106,11 @@ public class RecoveryScanner {
         }
         if (instance.getStatus() != WorkflowStatus.RUNNING) {
             return false;
+        }
+        boolean anyRunning = instance.getSteps().stream()
+                .anyMatch(step -> step.getStatus() == StepStatus.RUNNING);
+        if (!anyRunning) {
+            return instance.getSteps().stream().anyMatch(step -> step.getStatus() == StepStatus.PENDING);
         }
         return instance.getSteps().stream()
                 .filter(step -> step.getStatus() == StepStatus.RUNNING)

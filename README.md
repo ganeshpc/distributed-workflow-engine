@@ -4,7 +4,7 @@ A Java 21 / Spring Boot 4.1 workflow **orchestrator**. It coordinates a linear e
 
 This is **not** Temporal. There is no event-sourced history, no deterministic replay of workflow code, and no task-queue matching. The engine stores *where the saga is now* (`PENDING` / `RUNNING` / `COMPLETED` / `FAILED`) and commits each transition before it calls the next activity.
 
-**Current stage: Phase 3.** One Spring Boot process plus Postgres. Activities are in-process stubs (canned JSON, no real orders or payments). After a crash, a scanner resumes never-started admissions and leftover `RUNNING` steps that are still inside their deadline. A step that stays `RUNNING` past `deadline_at` fails with error `TIMED_OUT`. `FAILED` is not retried. How this maps to Kafka, workers, idempotency, and compensation is in [Current code vs the end goal](#current-code-vs-the-end-goal).
+**Current stage: Phase 5.** The engine and one worker process, plus Postgres and Kafka. The engine commits each step `RUNNING` and publishes a task. The worker runs the canned stub and publishes a result. A lost task is republished at the same attempt. A step past `deadline_at` fails with error `TIMED_OUT`. `FAILED` is not retried. Real side effects still wait for Phase 6 idempotency.
 
 The design contract is [`docs/architecture.md`](docs/architecture.md). Agent rules are in [`AGENTS.md`](AGENTS.md).
 
@@ -40,6 +40,8 @@ docker compose up -d
 # wait until postgres is healthy: docker compose ps
 
 mvn -pl engine -am spring-boot:run
+# second terminal
+mvn -pl worker -am spring-boot:run
 ```
 
 Health:
@@ -87,7 +89,7 @@ The engine listens on **8080**. Actuator exposes **`health` only**.
 
 The engine owns **orchestration metadata**: workflow id, type, definition version, status, current step, idempotency key, optimistic-lock version, per-step status/attempt/output/error/timestamps.
 
-It does **not** own orders, inventory, payments, shipments, or notifications. Phase 1/2 “activities” are stubs in `com.workflowengine.activity.stub`. They return `{"stub":true,"activity":"CREATE_ORDER"}` (and so on). They do not check stock or talk to a card network.
+It does **not** own orders, inventory, payments, shipments, or notifications. The activities are stubs in the `worker` process. They return `{"stub":true,"activity":"CREATE_ORDER"}` (and so on). They do not check stock or talk to a card network. `failAt` works only when that process runs with the `test` profile.
 
 Two consistency domains stay separate:
 
@@ -118,13 +120,12 @@ distributed-workflow-engine/     Maven aggregator; imports Spring Boot 4.1 BOM
 | `com.workflowengine.web` | REST adapters. Not named `.api`. |
 | `com.workflowengine.application` | Admit, get, snapshots. Request-thread exceptions. |
 | `com.workflowengine.domain` / `definition` | `ORDER` graph, `RetryPolicy`. |
-| `com.workflowengine.activity` | `ActivityInvoker` (sync in-process port). |
-| `com.workflowengine.activity.stub` | Demo adapters + `failAt` + test hooks. |
+| `com.workflowengine.worker` | Kafka listener and the five stub activities. |
 | `com.workflowengine.runtime` | `WorkflowExecutor`, `WorkflowDispatcher`, `RecoveryScanner`, `TimeoutPoller`. |
 | `com.workflowengine.persistence` | JPA entities and Spring Data. |
 | `com.workflowengine.config` | Task executor, clock, daemon scheduler. |
 
-`WorkflowExecutor` must not import the stub package. It depends on `ActivityInvoker`.
+`WorkflowExecutor` must not import the worker package. It publishes a task and applies the result.
 
 ---
 
@@ -288,19 +289,20 @@ Crash after first step-start (`version=1`, step 0 `RUNNING`, `attempt=1`). Scann
 
 1. Load type, `definition_version`, and `input_json` once (**seed**). Every activity gets that same input.
 2. Resolve `OrderWorkflowDefinition` (five `StepDefinition`s, default `RetryPolicy` maxAttempts=3, backoff=0, timeout 5 minutes).
-3. For each position 0..4:
-   - **prepareStep** (own transaction):
-     - Instance `COMPLETED` / `FAILED` → stop.
-     - Step `COMPLETED` → skip (continue walk). This is how resume continues after earlier steps already finished.
-     - Step `FAILED` → stop.
-     - Step `PENDING` → **step-start** (`RUNNING`, `attempt++`, `started_at=now()`, `deadline_at` from the engine clock, instance `RUNNING`).
-     - Step `RUNNING` → **running-resume** (Phase 2): if `deadline_at` is due, **step-fail** with `TIMED_OUT` and do not invoke; if `next_attempt_at` is in the future, stop; if `attempt+1 > maxAttempts`, **step-fail** with `RETRY_EXHAUSTED`; else `attempt++`, refresh `deadline_at`, bump `@Version`, then invoke.
-   - **Invoke** `ActivityInvoker` with **no** workflow transaction. `InProcessActivityInvoker` looks up the stub by name. Lookup miss → `UNKNOWN_ACTIVITY`. Thrown exception → `ACTIVITY_EXCEPTION`. Stubs may honor `failAt` and test block hooks.
-   - On `success=false` → **step-fail** transaction, stop. If the step is no longer `RUNNING`, the write is skipped and the walk stops.
-   - On success, last step → **workflow-complete** (step + instance `COMPLETED` together), unless the step is no longer `RUNNING`.
-   - On success, not last → **mid-step complete**, then next position. A skipped write (timeout already committed) stops the walk. It does not start the next step.
+3. One step per `run`:
+   - Instance `COMPLETED` / `FAILED`, or a step already `FAILED` → stop.
+   - Next `PENDING` step → **step-start** (`RUNNING`, `attempt++`, `started_at=now()`, `deadline_at`, `next_attempt_at` = now + republish delay), then **publish** `activity.tasks`. The engine returns. It waits for the broker ack, not for the worker.
+   - `RUNNING` and `deadline_at` due → **step-fail** `TIMED_OUT`. Do not publish.
+   - `RUNNING` and `next_attempt_at` still in the future → stop.
+   - `RUNNING` and due for republish → publish the same `attempt` again. Do not increment it.
+4. The worker runs the stub. Lookup miss → result `UNKNOWN_ACTIVITY`. Thrown exception → `ACTIVITY_EXCEPTION`. `failAt` applies only in the worker's test profile.
+5. The engine consumes `activity.results`:
+   - Step no longer `RUNNING`, or the attempt does not match → skip the write.
+   - `success=false` → **step-fail**, stop.
+   - Last step success → **workflow-complete** (step + instance `COMPLETED` together).
+   - Otherwise → **mid-step complete**, then `run` again to start the next step.
 
-Infrastructure failures (persistence, `@Version` conflict) are caught in `run`, logged ERROR, and **stop**. They do **not** mark the step `FAILED`. `GET` still returns 200 with the leftover. The recovery scanner retries a leftover that is still inside its deadline. The timeout poller fails one that is not.
+Infrastructure failures on `run` are logged and stop. They do **not** mark the step `FAILED`. A result-listener failure other than an optimistic-lock loss is retried by Kafka. `GET` still returns 200 with the leftover. The scanner republishes a due `RUNNING` step that is still inside its deadline. The timeout poller fails one that is not.
 
 ### C. `GET /api/v1/workflows/{id}` (request thread)
 
@@ -448,37 +450,31 @@ Postgres remains the source of truth for orchestration metadata. Kafka, when it 
 
 ### Topology
 
-| Concern | Now (Phase 2) | End goal (planned) |
+| Concern | Now (Phase 5) | Later |
 |---|---|---|
-| Processes | One JVM: REST + executor + stubs + scanner | Engine JVM(s) + **one** worker JVM first (Phase 5). Optional later split into service-owned workers (Phase 8). |
-| Compose | Postgres only | Postgres + Kafka. No five microservices on day one of Kafka. |
-| Who runs activities | Engine thread pool (`workflow-*`), in-process stubs | Worker process implements `Activity` from `engine-api`. Engine never calls the card network or stock DB. |
+| Processes | Engine JVM + one worker JVM | Optional split into service-owned workers (Phase 8). |
+| Compose | Postgres + Kafka | No five microservices. |
+| Who runs activities | Worker process implements `Activity` from `engine-api` | Still no card network or stock DB until Phase 6. |
 | Engine replicas | `replicas > 1` is a defect | Allowed only after out-of-process activities (5), idempotent activities (6), and `SKIP LOCKED` claim (9). |
 
 ### How a step runs
 
-**Now:** commit-before-invoke is **synchronous in one process**.
-
-1. Commit step `RUNNING`.
-2. Same thread calls `InProcessActivityInvoker` → stub `Activity.execute`.
-3. Same thread commits `COMPLETED` or `FAILED`.
-
-**End goal (Phase 5):** commit-before-invoke becomes **dispatch-and-complete-later**.
+**Now (Phase 5):** commit-before-invoke is **dispatch-and-complete-later**.
 
 1. Engine commits step `RUNNING`.
-2. Engine publishes a task (first cut: persist-then-publish; outbox may **replace** that path).
-3. Engine thread **returns**. It does not `future.get()` on Kafka.
-4. Worker executes the activity (own DB for business data).
+2. Engine publishes a task (persist-then-publish; no outbox).
+3. Engine thread returns. It does not wait for the worker.
+4. Worker executes the activity.
 5. Worker publishes a result keyed by `(workflowId, step, attempt)`.
 6. Engine result consumer applies the mid-step complete, workflow-complete, or step-fail transaction.
 
-`ActivityInvoker` as a blocking in-process port is a Phase 1/2 seam. Phase 5 rewrites the executor; it does not “implement Kafka by blocking.”
+**Later:** an outbox can replace the direct publish. Phase 6 makes the worker idempotent on that same key. The producer waits for the broker ack only. It does not wait for the activity result.
 
 ### Recovery
 
 | Now | End goal |
 |---|---|
-| `RecoveryScanner` finds `PENDING` / `RUNNING` in Postgres and calls `WorkflowDispatcher.submit` → in-process `WorkflowExecutor.run` | Same leftover rows. Scanner **republishes** stale `RUNNING` tasks to Kafka instead of invoking locally. Lost messages are recovered from committed `RUNNING`, not from Kafka as SoT. |
+| Scanner submits the executor, which republishes a due `RUNNING` task at the same attempt. Lost messages are recovered from the committed row. | Phase 9: multi-instance engines claim rows with `SKIP LOCKED` before publishing. |
 | Inflight set is in-memory (one process) | Multi-instance engines claim rows with `SELECT … FOR UPDATE SKIP LOCKED` (Phase 9). `@Version` rejects stale writers. |
 | `FAILED` is never retried, including error `TIMED_OUT` | Retry policy on `FAILED` can be turned on once backoff/`next_attempt_at` are used for that path. A distinct `TIMED_OUT` status waits until a phase branches on it. |
 
@@ -489,7 +485,7 @@ Postgres remains the source of truth for orchestration metadata. Kafka, when it 
 | Time | Per-attempt `deadline_at` (ORDER: 5 minutes). Poller fails a due `RUNNING` step with `TIMED_OUT`. Backoff field exists; ORDER uses zero delay. | Phase 10: first-class timer *steps*. The poller is not that. |
 | Activity failure | Stub `failAt` or `success=false` → step-fail; instance `FAILED`; later steps stay `PENDING`. | Same forward fail, then **compensation** (Phase 7): reverse walk of completed steps, states `COMPENSATING` / `COMPENSATED`. Requires Phase 6. |
 | Double invoke after crash | Real: stub runs twice. Documented. Stubs have no money/stock. | Phase 6: worker idempotency store “this attempt already completed.” Effectively-once = at-least-once delivery + idempotent handler. **Hard gate** before real payment/inventory. |
-| `failAt` | Stubs honor it always. | Workers ignore `failAt` unless `spring.profiles.active=test`. |
+| `failAt` | Worker honors it only when `spring.profiles.active=test`. | Unchanged. |
 
 ### API and definitions
 
@@ -510,11 +506,12 @@ Postgres remains the source of truth for orchestration metadata. Kafka, when it 
 ### Picture
 
 ```
-Now (Phase 3)
-  Client → Engine HTTP → admit commit → workflow-* thread → stub.execute → complete/fail commit
-                         ↘ deadline_at due → TimeoutPoller → FAILED / TIMED_OUT (late complete discarded)
-                         ↘ crash leftover still inside deadline → RecoveryScanner → stub.execute again
-                         ↘ crash leftover past deadline → FAILED / TIMED_OUT, no second invoke
+Now (Phase 5)
+  Client → Engine HTTP → admit commit → workflow-* thread → publish activity.tasks
+                         → worker → stub.execute → activity.results → engine complete/fail commit
+                         ↘ deadline_at due → TimeoutPoller → FAILED / TIMED_OUT (late result discarded)
+                         ↘ lost task, deadline still open → scanner republishes the same attempt
+                         ↘ deadline already due → FAILED / TIMED_OUT, no republish
 
 End goal (Phase 5–9, still current-state)
   Client → Engine HTTP → admit commit
@@ -594,7 +591,7 @@ Testcontainers starts its own `postgres:16`. You do not need Compose for tests.
 |---|---|
 | `WorkflowApiTest` | HTTP admit snapshot, poll to terminal, idempotency, `failAt`, 400/404/413, Scalar UI |
 | `WorkflowExecutionTest` | Version 10, `failAt`, concurrent admit, blocked-stub admit snapshot |
-| `WorkflowDurabilityTest` | Second connection sees `RUNNING`; new context re-invokes (Phase 2) |
+| `WorkflowDurabilityTest` | Second connection sees `RUNNING`; new engine republishes the same attempt |
 | `WorkflowRecoveryTest` | Never-started `PENDING` completes; `FAILED` not retried |
 | `WorkflowTimeoutTest` | Due deadline → `FAILED` / `TIMED_OUT`; late success discarded; restart does not re-invoke |
 | `WorkflowPersistenceTest` | Flyway v2, unique keys, `@Version` starts at 0 |
@@ -612,9 +609,9 @@ Manual leftover checks (SQL plant + restart) are described in the Phase 2 PR dis
 | 1 | Done | Admit-then-run, stubs, REST, commit-before-invoke, no resume |
 | 2 | Done | Scanner, `RUNNING` re-invoke, `FAILED` left alone, retry policy + `next_attempt_at` |
 | 3 | Done | Timeout poller: `deadline_at`, `FAILED` / `TIMED_OUT`, late completion discarded |
-| 4 | Optional, next if the worker seam is still sloppy | Harden `Activity` as the worker contract |
-| 5 | Planned | Kafka + **one** worker process (needs the Phase 2 scanner to republish stale `RUNNING`) |
-| 6 | Planned | Activity idempotency (required before real side effects) |
+| 4 | Skipped | The worker contract was already `Activity` in `engine-api` |
+| 5 | Done | Kafka plus one worker. Republish keeps the same attempt. |
+| 6 | Next | Activity idempotency (required before real side effects) |
 | 7+ | Planned | Compensation, optional worker split, multi-instance engine, signals, observability |
 
 Do not run `replicas > 1` until out-of-process activities (5), idempotent activities (6), and claim/lock (9) exist.

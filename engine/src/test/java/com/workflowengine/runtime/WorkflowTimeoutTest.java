@@ -1,9 +1,10 @@
 package com.workflowengine.runtime;
 
 import com.workflowengine.WorkflowEngineApplication;
-import com.workflowengine.activity.stub.ActivityBlockHook;
-import com.workflowengine.activity.stub.CreateOrderActivity;
-import com.workflowengine.activity.stub.StubInvocationCounters;
+import com.workflowengine.support.KafkaWorkers;
+import com.workflowengine.worker.activity.ActivityBlockHook;
+import com.workflowengine.worker.activity.CreateOrderActivity;
+import com.workflowengine.worker.activity.StubInvocationCounters;
 import com.workflowengine.api.StartWorkflowCommand;
 import com.workflowengine.api.StepStatus;
 import com.workflowengine.api.WorkflowStatus;
@@ -15,6 +16,7 @@ import com.workflowengine.persistence.WorkflowInstanceRepository;
 import com.workflowengine.persistence.WorkflowStepEntity;
 import com.workflowengine.support.AdjustableClock;
 import com.workflowengine.support.WorkflowAwait;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -23,6 +25,7 @@ import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.support.GenericApplicationContext;
+import org.testcontainers.kafka.KafkaContainer;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.containers.wait.strategy.WaitAllStrategy;
@@ -50,9 +53,14 @@ class WorkflowTimeoutTest {
     private static final AdjustableClock CLOCK = new AdjustableClock(START);
 
     private static PostgreSQLContainer postgres;
+    private static KafkaContainer kafka;
+    private static ConfigurableApplicationContext worker;
 
     @BeforeAll
-    static void startPostgres() {
+    static void startInfra() {
+        kafka = KafkaWorkers.newContainer();
+        kafka.start();
+        worker = KafkaWorkers.startWorker(kafka);
         postgres = new PostgreSQLContainer("postgres:16")
                 .waitingFor(new WaitAllStrategy()
                         .withStrategy(Wait.forLogMessage(
@@ -60,6 +68,16 @@ class WorkflowTimeoutTest {
                         .withStrategy(Wait.forListeningPort())
                         .withStartupTimeout(Duration.ofSeconds(60)));
         postgres.start();
+    }
+
+    @AfterAll
+    static void stopInfra() {
+        if (worker != null) {
+            worker.close();
+        }
+        if (kafka != null) {
+            kafka.close();
+        }
     }
 
     @BeforeEach
@@ -217,7 +235,8 @@ class WorkflowTimeoutTest {
                 "--spring.jpa.hibernate.ddl-auto=none",
                 "--spring.flyway.enabled=true",
                 "--workflow.recovery.interval-ms=600000",
-                "--workflow.timeout.interval-ms=600000"
+                "--workflow.timeout.interval-ms=600000",
+                KafkaWorkers.bootstrapArg(kafka)
         );
     }
 }

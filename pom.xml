@@ -13,6 +13,7 @@
 
   <modules>
     <module>engine-api</module>
+    <module>worker</module>
     <module>engine</module>
   </modules>
 

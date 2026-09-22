@@ -28,7 +28,7 @@ Honesty labels used in `docs/architecture.md`:
 - **Planned** — later increment. Do not start unless the user asked for that phase.
 - **Theoretical** — vocabulary only. Not committed.
 
-Current code is Phase 3 (PR-06): a poller fails a `RUNNING` step whose `deadline_at` is due (`FAILED`, error `TIMED_OUT`). Expired leftovers are not re-invoked. `FAILED` is not retried. Next planned increment is Phase 4 (optional `Activity` contract hardening) or Phase 5 (Kafka and one worker) when that phase is requested. Do not scaffold Kafka, worker modules, compensation, signals, timer steps, or a designer "for later".
+Current code is Phase 5 (PR-08): the engine commits `RUNNING`, publishes `activity.tasks`, and applies `activity.results`. One `worker` module runs the five stubs. Republish keeps the same `attempt`. `FAILED` is not retried. Next planned increment is Phase 6 (activity idempotency) when that phase is requested. Do not scaffold compensation, signals, timer steps, a second worker, or a designer "for later".
 
 ---
 
@@ -53,7 +53,8 @@ Do not add Spring Statemachine, Kafka, Redis, Elasticsearch, gRPC, Micrometer da
 ```
 distributed-workflow-engine/     aggregator POM; Boot BOM; pluginManagement
   engine-api/                    JDK-only contracts (no Spring, JPA, Jackson, Kafka, Lombok)
-  engine/                        Spring Boot app + orchestration
+  worker/                        One Spring Boot process. Kafka consumer. Five stub activities.
+  engine/                        Spring Boot app + orchestration. Publishes tasks, applies results.
 ```
 
 Maven coordinates: `groupId` `com.workflowengine`, version `0.1.0-SNAPSHOT`.
@@ -74,13 +75,12 @@ A future `worker` module must depend on `engine-api` only, never on `engine`.
 | `com.workflowengine.web` | REST adapters only. Not named `.api`. |
 | `com.workflowengine.application` | Admission, get, snapshots, request-thread exceptions |
 | `com.workflowengine.domain` / `definition` | Workflow/step definitions and registry |
-| `com.workflowengine.activity` | `ActivityInvoker`, in-process invoker, registry |
-| `com.workflowengine.activity.stub` | Demo adapters. Not business services. |
+| `com.workflowengine.worker` | One worker process. Kafka listener and the five stub activities. |
 | `com.workflowengine.runtime` | `WorkflowExecutor`, `RecoveryScanner`, `TimeoutPoller` |
 | `com.workflowengine.persistence` | Entities, Spring Data, Flyway-aligned mapping |
 | `com.workflowengine.config` | Boot configuration beans |
 
-`WorkflowExecutor` must not import `activity.stub`. It depends on `ActivityInvoker`. There is a bytecode test for this; keep it green.
+`WorkflowExecutor` must not import `com.workflowengine.worker`. It publishes a task and applies a result. There is a bytecode test that it does not name the stub package; keep it green.
 
 Do not create empty `worker*` modules. Modules appear in the PR that first has a class a JVM will load.
 
@@ -123,7 +123,7 @@ After a committed `RUNNING` write, invoke. On process death the **recovery scann
 | Leftover | Phase 2 |
 |---|---|
 | Instance `PENDING`, all steps `PENDING` | Resume: start the first step |
-| Instance `RUNNING`, one step `RUNNING`, deadline still in the future | Resume: re-invoke that step (`attempt++`) when `next_attempt_at` is due, and refresh `deadline_at` |
+| Instance `RUNNING`, one step `RUNNING`, deadline still in the future, `next_attempt_at` due | Republish that task at the same `attempt`. Do not invoke inside the engine. |
 | Instance `RUNNING`, `deadline_at` due | Phase 3: step-fail with error `TIMED_OUT`. Do not increment `attempt`. Do not invoke. |
 | Instance `FAILED` | Leave terminal. Do not retry. Timeout uses this status; there is no `TIMED_OUT` enum value. |
 
@@ -160,13 +160,9 @@ Mid-step complete transactions that do not change instance status still bump `@V
 
 ### Activity port
 
-`ActivityInvoker.invoke` is a **sync in-process port**. Phase 5 rewrites the executor to dispatch-and-complete-later. Do not implement Kafka by blocking on `future.get()`.
+The worker's invoker is local to that process. Lookup miss → `ActivityResult(false, null, "UNKNOWN_ACTIVITY:" + stepName)`. `Activity.execute` throwing → `ACTIVITY_EXCEPTION:…`. Neither throws to the listener. The engine does not block on the worker. A producer `get` waits only for the broker ack.
 
-`InProcessActivityInvoker`:
-
-- Lookup miss → `ActivityResult(false, null, "UNKNOWN_ACTIVITY:" + stepName)`. Does not throw.
-- `Activity.execute` throwing → catch, return `ACTIVITY_EXCEPTION:…`. Does not throw to the executor.
-- Does not interpret `failAt`. Stubs do.
+`failAt` is honored only when the worker's `spring.profiles.active=test`.
 
 `failAt` is a demo backdoor on stubs only. Unknown `failAt` → all steps succeed. Future workers ignore it unless `spring.profiles.active=test`.
 
@@ -378,7 +374,7 @@ No Prometheus, Jaeger, ELK, or Zipkin in Compose until Phase 11.
 - `201` tests must pin the **admit snapshot**: `PENDING`, `version=0`, `currentStep=null`, all steps `PENDING`. Prove it with a blocked first stub while POST returns.
 - Poll `GET` (or repository load) until terminal with a ~5s timeout. Happy path: five `COMPLETED` in position order, `attempt = 1`, `version = 10`, `currentStep = SEND_NOTIFICATION`, instance output equals last step output.
 - `failAt=PROCESS_PAYMENT` and `failAt=CREATE_ORDER` plus unknown `failAt` are required scenarios when changing the executor or stubs.
-- Durability / recovery: block inside `execute`; a **second DB connection** must see `RUNNING`. A **new** Spring context against the same database must re-invoke (`attempt++`) when the deadline is still in the future. Inserting a `RUNNING` row by hand is not a substitute. A `FAILED` instance must not be retried after restart.
+- Durability / recovery: block inside the worker `execute`; a **second DB connection** must see `RUNNING`. A **new** engine context against the same database republishes that task at the same `attempt`, and the worker runs it again. Inserting a `RUNNING` row by hand is not a substitute. A `FAILED` instance must not be retried after restart.
 - Timeout: move the engine `Clock` (do not `Thread.sleep` for the deadline). An in-flight step past `deadline_at` becomes `FAILED` with error `TIMED_OUT` and a late success must not overwrite it. A restarted process past `deadline_at` must not invoke again.
 - Concurrent admit with the same key: one instance, one executor submit. Test the unique-violation path, not only sequential SELECT-then-INSERT.
 - Idempotent `200` must not submit a second executor.

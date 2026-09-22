@@ -3,12 +3,13 @@ package com.workflowengine.domain;
 import java.time.Duration;
 
 /**
- * How the Phase 2 scanner treats a leftover {@code RUNNING} step.
+ * Attempt cap carried on a step definition.
  *
- * <p>{@code FAILED} stays terminal regardless of this policy. Crash resume of
- * {@code RUNNING} increments {@code attempt}; when the next attempt would
- * exceed {@link #maxAttempts()}, the executor records poison
- * {@code RETRY_EXHAUSTED} and marks the step and instance {@code FAILED}.
+ * <p>{@code FAILED} stays terminal. Phase 5 republish of a {@code RUNNING}
+ * step does not increment {@code attempt} and does not consult
+ * {@link #maxAttempts()}. A lost task is bounded by {@code deadline_at}.
+ * The cap remains on the definition for a later phase that retries a
+ * finished attempt.
  *
  * <p>Immutable. {@link #defaults()} is three attempts and no backoff so
  * recovery tests see a second invoke immediately.

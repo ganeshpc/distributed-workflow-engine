@@ -2,16 +2,22 @@ package com.workflowengine.web;
 
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
-import com.workflowengine.activity.stub.ActivityBlockHook;
-import com.workflowengine.activity.stub.CreateOrderActivity;
-import com.workflowengine.activity.stub.StubInvocationCounters;
+import com.workflowengine.support.KafkaWorkers;
+import com.workflowengine.worker.activity.ActivityBlockHook;
+import com.workflowengine.worker.activity.CreateOrderActivity;
+import com.workflowengine.worker.activity.StubInvocationCounters;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
@@ -20,6 +26,7 @@ import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.containers.wait.strategy.WaitAllStrategy;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.kafka.KafkaContainer;
 
 import java.time.Duration;
 import java.util.List;
@@ -56,6 +63,11 @@ class WorkflowApiTest {
     );
 
     @Container
+    static KafkaContainer kafka = KafkaWorkers.newContainer();
+
+    private static ConfigurableApplicationContext worker;
+
+    @Container
     @ServiceConnection
     static PostgreSQLContainer postgres = new PostgreSQLContainer("postgres:16")
             .waitingFor(new WaitAllStrategy()
@@ -63,6 +75,23 @@ class WorkflowApiTest {
                             ".*database system is ready to accept connections.*\\s", 2))
                     .withStrategy(Wait.forListeningPort())
                     .withStartupTimeout(Duration.ofSeconds(60)));
+
+    @DynamicPropertySource
+    static void kafkaProperties(DynamicPropertyRegistry registry) {
+        registry.add("spring.kafka.bootstrap-servers", kafka::getBootstrapServers);
+    }
+
+    @BeforeAll
+    static void startWorker() {
+        worker = KafkaWorkers.startWorker(kafka);
+    }
+
+    @AfterAll
+    static void stopWorker() {
+        if (worker != null) {
+            worker.close();
+        }
+    }
 
     @Autowired
     private MockMvc mockMvc;

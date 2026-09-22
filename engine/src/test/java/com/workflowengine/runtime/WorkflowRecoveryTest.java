@@ -1,8 +1,9 @@
 package com.workflowengine.runtime;
 
 import com.workflowengine.WorkflowEngineApplication;
-import com.workflowengine.activity.stub.CreateOrderActivity;
-import com.workflowengine.activity.stub.StubInvocationCounters;
+import com.workflowengine.support.KafkaWorkers;
+import com.workflowengine.worker.activity.CreateOrderActivity;
+import com.workflowengine.worker.activity.StubInvocationCounters;
 import com.workflowengine.api.StartWorkflowCommand;
 import com.workflowengine.api.StepStatus;
 import com.workflowengine.api.WorkflowStatus;
@@ -12,6 +13,7 @@ import com.workflowengine.persistence.WorkflowInstanceEntity;
 import com.workflowengine.persistence.WorkflowInstanceRepository;
 import com.workflowengine.persistence.WorkflowStepEntity;
 import com.workflowengine.support.WorkflowAwait;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -19,6 +21,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
+import org.testcontainers.kafka.KafkaContainer;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.containers.wait.strategy.WaitAllStrategy;
@@ -44,9 +47,14 @@ class WorkflowRecoveryTest {
     );
 
     private static PostgreSQLContainer postgres;
+    private static KafkaContainer kafka;
+    private static ConfigurableApplicationContext worker;
 
     @BeforeAll
-    static void startPostgres() {
+    static void startInfra() {
+        kafka = KafkaWorkers.newContainer();
+        kafka.start();
+        worker = KafkaWorkers.startWorker(kafka);
         postgres = new PostgreSQLContainer("postgres:16")
                 .waitingFor(new WaitAllStrategy()
                         .withStrategy(Wait.forLogMessage(
@@ -54,6 +62,16 @@ class WorkflowRecoveryTest {
                         .withStrategy(Wait.forListeningPort())
                         .withStartupTimeout(Duration.ofSeconds(60)));
         postgres.start();
+    }
+
+    @AfterAll
+    static void stopInfra() {
+        if (worker != null) {
+            worker.close();
+        }
+        if (kafka != null) {
+            kafka.close();
+        }
     }
 
     @BeforeEach
@@ -167,7 +185,8 @@ class WorkflowRecoveryTest {
                         "--spring.jpa.hibernate.ddl-auto=none",
                         "--spring.flyway.enabled=true",
                         "--workflow.recovery.enabled=" + recoveryEnabled,
-                        "--workflow.recovery.interval-ms=200"
+                        "--workflow.recovery.interval-ms=200",
+                        KafkaWorkers.bootstrapArg(kafka)
                 );
     }
 }

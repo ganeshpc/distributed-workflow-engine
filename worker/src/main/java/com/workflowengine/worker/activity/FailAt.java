@@ -1,4 +1,4 @@
-package com.workflowengine.activity.stub;
+package com.workflowengine.worker.activity;
 
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
@@ -15,7 +15,21 @@ final class FailAt {
 
     private static final JsonMapper MAPPER = JsonMapper.builder().build();
 
+    private static volatile boolean honor;
+
     private FailAt() {
+    }
+
+    /**
+     * Turns demo failure injection on or off for this JVM.
+     *
+     * <p>The worker sets this from the Spring environment. The default is off
+     * so a non-test process ignores {@code failAt}.
+     *
+     * @param enabled true only for the test profile
+     */
+    static void setHonor(boolean enabled) {
+        honor = enabled;
     }
 
     /**
@@ -24,7 +38,7 @@ final class FailAt {
      * @return true when this stub should return {@code STUB_FORCED_FAILURE}
      */
     static boolean matches(String workflowInputJson, String activityName) {
-        if (workflowInputJson == null || workflowInputJson.isBlank() || activityName == null) {
+        if (!honor || workflowInputJson == null || workflowInputJson.isBlank() || activityName == null) {
             return false;
         }
         try {

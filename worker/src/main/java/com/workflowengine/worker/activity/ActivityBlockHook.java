@@ -1,4 +1,4 @@
-package com.workflowengine.activity.stub;
+package com.workflowengine.worker.activity;
 
 import java.time.Duration;
 import java.util.concurrent.ConcurrentHashMap;

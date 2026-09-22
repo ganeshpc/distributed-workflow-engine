@@ -1099,14 +1099,16 @@ Phase 1 already has `Activity` in `engine-api` and a sync `ActivityInvoker` in `
 
 If Phase 1 review finds the seam already clean, this phase is a thin PR or a skip.
 
-### Phase 5 — Kafka dispatch + one worker process (**Planned**)
+### Phase 5 — Kafka dispatch + one worker process (**implemented**, PR-08)
 
-- Compose gains Kafka.
-- New module: `worker` (one). Depends on `engine-api`. Hosts the five `Activity` classes. **Ignores `failAt` unless `spring.profiles.active=test`.**
-- `WorkflowExecutor` is rewritten: commit `RUNNING`, publish (or outbox), return; a result consumer applies complete/fail transactions.
-- `InProcessActivityInvoker` is not "implemented" by Kafka.
-- First cut: persist-then-publish + republish scanner. Outbox replaces that path if needed.
-- **Do not** create five worker services.
+- Compose gains Kafka (KRaft, no ZooKeeper).
+- Module `worker` depends on `engine-api` only and hosts the five activities. `failAt` is honored only when `spring.profiles.active=test`.
+- After the step-start commit the engine publishes `activity.tasks` and returns. `workflow_step.next_attempt_at` is the earliest republish time (`workflow.dispatch.republish-after-ms`, default 30 seconds). The publish waits for the broker ack, not for the worker.
+- The worker publishes `activity.results`. The engine applies the existing complete or fail transaction. A result for a step that is no longer `RUNNING` at that attempt is discarded.
+- Republish uses the same `attempt`. It does not increment and does not consult `RetryPolicy.maxAttempts`. The deadline still fails a stuck `RUNNING` step.
+- A crash after a mid-step complete and before the next step-start leaves instance `RUNNING`, no `RUNNING` step, and a later `PENDING` step. The scanner submits that gap and the executor starts the next step.
+- No outbox in this cut. The scanner republish replaces a lost publish. Do not add a second publish path beside it.
+- One worker JVM. No five-service split. No worker database. Stubs are still canned JSON.
 
 Concepts: at-least-once delivery, correlation by `(workflowId, step, attempt)`.
 
@@ -1376,7 +1378,7 @@ If a Phase 1 PR wants to change those, that is a document revision, not a silent
 
 Deferred, **non-blocking** for Phase 1:
 
-- Whether Phase 5 uses an outbox in the first Kafka PR or only a republish scanner.
+- Phase 5 shipped republish without an outbox. Move to an outbox only by replacing that publish path.
 - Whether Phase 8 ever happens.
 - Whether JSON definitions are worth it after a third workflow type.
 - Whether Phase 12 gRPC happens.
@@ -1459,7 +1461,7 @@ Do not open a PR that scaffolds unused worker services, Kafka, or a designer.
 - **Depends on:** **PR-04** (Phase 1 accepted). Does **not** depend on PR-06.
 - **Description:** No new runtime behavior unless Phase 1 leaked stub dependencies. May run in parallel with PR-05/PR-06.
 
-### PR-08 — Kafka and a single worker process (**Phase 5**)
+### PR-08 — Kafka and a single worker process (**Phase 5**, **implemented**)
 
 - **Title:** Dispatch activities over Kafka to one worker module
 - **Files/components:** new `worker` module depending on `engine-api`; compose Kafka; executor rewrite (async complete); task/result topics; republish of stale `RUNNING`; Testcontainers Kafka; `failAt` ignored outside test profile

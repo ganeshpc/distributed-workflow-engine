@@ -4,15 +4,25 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
 /**
- * Boot entry point for the Phase 1 single-process engine.
+ * Boot entry point for the engine process.
  *
- * <p>Scans {@code com.workflowengine} for web, admission, executor, stubs, and
- * persistence. Listens on port 8080. Actuator exposes {@code health} only.
+ * <p>Scans the engine packages only. Activity stubs live in the worker
+ * process and must not be component-scanned here, including when a test
+ * classpath contains the worker jar. Listens on port 8080. Actuator exposes
+ * {@code health} only.
  *
  * <p>This class is a process singleton created by Spring. Failure to start
- * (missing Postgres, Flyway error) is a JVM exit, not an HTTP mapping.
+ * (missing Postgres, Kafka, or Flyway) is a JVM exit, not an HTTP mapping.
  */
-@SpringBootApplication
+@SpringBootApplication(scanBasePackages = {
+        "com.workflowengine.application",
+        "com.workflowengine.config",
+        "com.workflowengine.definition",
+        "com.workflowengine.domain",
+        "com.workflowengine.persistence",
+        "com.workflowengine.runtime",
+        "com.workflowengine.web"
+})
 public class WorkflowEngineApplication {
 
     /**

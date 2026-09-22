@@ -1,5 +1,6 @@
 package com.workflowengine.persistence;
 
+import com.workflowengine.support.KafkaWorkers;
 import com.workflowengine.api.StepStatus;
 import com.workflowengine.api.WorkflowStatus;
 import org.flywaydb.core.Flyway;
@@ -7,12 +8,15 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.containers.wait.strategy.WaitAllStrategy;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.kafka.KafkaContainer;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -37,6 +41,14 @@ class WorkflowPersistenceTest {
             "CREATE_SHIPMENT",
             "SEND_NOTIFICATION"
     );
+
+    @Container
+    static KafkaContainer kafka = KafkaWorkers.newContainer();
+
+    @DynamicPropertySource
+    static void kafkaProperties(DynamicPropertyRegistry registry) {
+        registry.add("spring.kafka.bootstrap-servers", kafka::getBootstrapServers);
+    }
 
     @Container
     @ServiceConnection

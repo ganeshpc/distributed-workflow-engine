@@ -1,4 +1,4 @@
-package com.workflowengine.activity.stub;
+package com.workflowengine.worker.activity;
 
 import com.workflowengine.api.activity.ActivityContext;
 import com.workflowengine.api.activity.ActivityResult;
@@ -6,8 +6,9 @@ import com.workflowengine.api.activity.ActivityResult;
 /**
  * Shared stub body: count, honor block hooks, then {@code failAt} or canned JSON.
  *
- * <p>Not a business service. Runs on the executor thread after the step-start transaction
- * committed. {@code failAt} is interpreted here, not in the invoker.
+ * <p>Not a business service. Runs on the worker listener thread after the engine
+ * has committed {@code RUNNING} and published the task. {@code failAt} is
+ * interpreted here only when the test profile enabled it.
  */
 final class StubSupport {
 

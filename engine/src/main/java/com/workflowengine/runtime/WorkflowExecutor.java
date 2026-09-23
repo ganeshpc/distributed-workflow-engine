@@ -190,7 +190,11 @@ public class WorkflowExecutor {
                 tx.executeWithoutResult(status -> applyTimeoutIfDue(workflowId));
             } catch (RuntimeException ex) {
                 log.error("executor infrastructure failure workflowId={} reason=timeout", workflowId, ex);
+                return;
             }
+        }
+        if (compensating(workflowId)) {
+            run(workflowId);
         }
     }
 
@@ -232,7 +236,8 @@ public class WorkflowExecutor {
             return null;
         }
         if (instance.getStatus() == WorkflowStatus.COMPLETED
-                || instance.getStatus() == WorkflowStatus.FAILED) {
+                || instance.getStatus() == WorkflowStatus.FAILED
+                || instance.getStatus() == WorkflowStatus.COMPENSATED) {
             return null;
         }
         WorkflowDefinition definition = definitions.findByType(instance.getType()).orElse(null);
@@ -241,19 +246,23 @@ public class WorkflowExecutor {
                     workflowId, instance.getType());
             return null;
         }
-        List<StepDefinition> steps = definition.steps();
-        for (int position = 0; position < steps.size(); position++) {
-            StepDefinition stepDef = steps.get(position);
-            WorkflowStepEntity step = stepAt(instance, position);
-            if (step.getStatus() == StepStatus.COMPLETED) {
+        boolean compensating = instance.getStatus() == WorkflowStatus.COMPENSATING;
+        List<WorkflowStepEntity> ordered = instance.getSteps().stream()
+                .sorted(java.util.Comparator.comparingInt(WorkflowStepEntity::getPosition))
+                .toList();
+        for (WorkflowStepEntity step : ordered) {
+            if (step.getStatus() == StepStatus.COMPLETED || step.getStatus() == StepStatus.COMPENSATED) {
                 continue;
             }
             if (step.getStatus() == StepStatus.FAILED) {
-                return null;
+                continue;
+            }
+            if (compensating && !isCompensation(definition, step.getName())) {
+                continue;
             }
             if (step.getStatus() == StepStatus.PENDING) {
-                int attempt = startStep(instance, step, stepDef.name(), stepDef.timeout());
-                return contextFor(instance, stepDef.name(), attempt);
+                int attempt = startStep(instance, step, step.getName(), timeoutFor(definition, step.getName()));
+                return contextFor(instance, step.getName(), attempt);
             }
             return republishIfDue(instance, step);
         }
@@ -288,7 +297,7 @@ public class WorkflowExecutor {
             return false;
         }
         if (step.getStatus() != StepStatus.RUNNING
-                || instance.getStatus() != WorkflowStatus.RUNNING
+                || !forwardOrCompensating(instance.getStatus())
                 || step.getAttempt() != completion.attempt()) {
             log.info("step write skipped workflowId={} type={} step={} attempt={} status={} version={} reason=not_running",
                     instance.getId(), instance.getType(), step.getName(), step.getAttempt(),
@@ -297,9 +306,17 @@ public class WorkflowExecutor {
         }
         ActivityResult result = new ActivityResult(
                 completion.success(), completion.outputJson(), completion.error());
-        boolean last = step.getPosition() == definition.steps().size() - 1;
+        int lastPosition = instance.getSteps().stream()
+                .mapToInt(WorkflowStepEntity::getPosition)
+                .max()
+                .orElseThrow();
+        boolean last = step.getPosition() == lastPosition;
         if (!completion.success()) {
-            failStep(completion.workflowId(), step.getPosition(), result);
+            boolean wrote = failStep(completion.workflowId(), step.getPosition(), result);
+            return wrote && compensating(completion.workflowId());
+        }
+        if (last && isCompensation(definition, step.getName())) {
+            completeCompensation(completion.workflowId(), step.getPosition(), result);
             return false;
         }
         if (last) {
@@ -333,12 +350,14 @@ public class WorkflowExecutor {
         step.setAttempt(attempt);
         step.setNextAttemptAt(republishAfter.isZero() ? null : now.plus(republishAfter));
         step.setDeadlineAt(deadlineFor(now, timeout));
-        instance.setStatus(WorkflowStatus.RUNNING);
+        if (instance.getStatus() != WorkflowStatus.COMPENSATING) {
+            instance.setStatus(WorkflowStatus.RUNNING);
+        }
         instance.setCurrentStep(stepName);
         stampStartedAt(step);
 
-        log.info("step started workflowId={} type={} step={} attempt={} status=RUNNING version={}",
-                instance.getId(), instance.getType(), stepName, attempt, instance.getVersion());
+        log.info("step started workflowId={} type={} step={} attempt={} status={} version={}",
+                instance.getId(), instance.getType(), stepName, attempt, instance.getStatus(), instance.getVersion());
         return attempt;
     }
 
@@ -404,6 +423,7 @@ public class WorkflowExecutor {
         step.setStatus(StepStatus.COMPLETED);
         step.setOutputJson(result.outputJson());
         step.setError(null);
+        markForwardCompensated(instance, step.getName());
         entityManager.lock(instance, LockModeType.OPTIMISTIC_FORCE_INCREMENT);
         stampCompletedAt(step);
 
@@ -442,6 +462,37 @@ public class WorkflowExecutor {
     }
 
     /**
+     * Last compensation transaction: compensation step {@code COMPLETED}, the
+     * forward step {@code COMPENSATED}, and the instance {@code COMPENSATED}.
+     * Instance {@code output_json} stays null. The forward failure stays in
+     * {@code error}.
+     *
+     * @param workflowId instance id
+     * @param position compensation step index
+     * @param result successful compensation output
+     * @return false when the step is no longer {@code RUNNING}
+     */
+    private boolean completeCompensation(UUID workflowId, int position, ActivityResult result) {
+        WorkflowInstanceEntity instance = instances.findById(workflowId).orElseThrow();
+        WorkflowStepEntity step = stepAt(instance, position);
+        if (!stillRunning(instance, step)) {
+            return false;
+        }
+        step.setStatus(StepStatus.COMPLETED);
+        step.setOutputJson(result.outputJson());
+        step.setError(null);
+        markForwardCompensated(instance, step.getName());
+        instance.setStatus(WorkflowStatus.COMPENSATED);
+        instance.setCurrentStep(step.getName());
+        instance.setOutputJson(null);
+        stampCompletedAt(step);
+
+        log.info("workflow compensated workflowId={} type={} step={} attempt={} status=COMPENSATED version={}",
+                workflowId, instance.getType(), step.getName(), step.getAttempt(), instance.getVersion());
+        return true;
+    }
+
+    /**
      * Step-fail transaction: step and instance {@code FAILED}. Instance {@code output_json}
      * stays null. Terminal; {@code FAILED} is not retried.
      *
@@ -465,11 +516,20 @@ public class WorkflowExecutor {
         if (result.outputJson() != null) {
             step.setOutputJson(result.outputJson());
         }
+        stampCompletedAt(step);
+        if (instance.getStatus() == WorkflowStatus.RUNNING && planCompensation(instance, step)) {
+            instance.setStatus(WorkflowStatus.COMPENSATING);
+            instance.setCurrentStep(step.getName());
+            instance.setError(result.error());
+            instance.setOutputJson(null);
+            log.info("workflow compensating workflowId={} type={} step={} attempt={} status=COMPENSATING version={}",
+                    workflowId, instance.getType(), step.getName(), step.getAttempt(), instance.getVersion());
+            return true;
+        }
         instance.setStatus(WorkflowStatus.FAILED);
         instance.setCurrentStep(step.getName());
         instance.setError(result.error());
         instance.setOutputJson(null);
-        stampCompletedAt(step);
 
         log.info("workflow failed workflowId={} type={} step={} attempt={} status=FAILED version={}",
                 workflowId, instance.getType(), step.getName(), step.getAttempt(), instance.getVersion());
@@ -485,7 +545,7 @@ public class WorkflowExecutor {
      */
     private void applyTimeoutIfDue(UUID workflowId) {
         WorkflowInstanceEntity instance = instances.findById(workflowId).orElse(null);
-        if (instance == null || instance.getStatus() != WorkflowStatus.RUNNING) {
+        if (instance == null || !forwardOrCompensating(instance.getStatus())) {
             return;
         }
         Instant now = clock.instant();
@@ -505,7 +565,7 @@ public class WorkflowExecutor {
      * @return true only when both are still {@code RUNNING}
      */
     private boolean stillRunning(WorkflowInstanceEntity instance, WorkflowStepEntity step) {
-        if (step.getStatus() == StepStatus.RUNNING && instance.getStatus() == WorkflowStatus.RUNNING) {
+        if (step.getStatus() == StepStatus.RUNNING && forwardOrCompensating(instance.getStatus())) {
             return true;
         }
         log.info("step write skipped workflowId={} type={} step={} attempt={} status={} version={} reason=not_running",
@@ -568,6 +628,104 @@ public class WorkflowExecutor {
      * @return matching step
      * @throws IllegalStateException if the position is missing
      */
+    /**
+     * Inserts pending compensation rows for completed forward steps before
+     * {@code failed}, newest first. A step with no compensator is skipped.
+     *
+     * @param instance aggregate already in this transaction
+     * @param failed forward step that just failed
+     * @return true when at least one compensation row was inserted
+     */
+    private boolean planCompensation(WorkflowInstanceEntity instance, WorkflowStepEntity failed) {
+        WorkflowDefinition definition = definitions.findByType(instance.getType()).orElse(null);
+        if (definition == null) {
+            return false;
+        }
+        List<WorkflowStepEntity> completed = instance.getSteps().stream()
+                .filter(step -> step.getPosition() < failed.getPosition()
+                        && step.getStatus() == StepStatus.COMPLETED)
+                .sorted(java.util.Comparator.comparingInt(WorkflowStepEntity::getPosition).reversed())
+                .toList();
+        int nextPosition = instance.getSteps().stream()
+                .mapToInt(WorkflowStepEntity::getPosition)
+                .max()
+                .orElse(-1) + 1;
+        boolean planned = false;
+        for (WorkflowStepEntity forward : completed) {
+            String compensationName = compensationName(definition, forward.getName());
+            if (compensationName == null) {
+                continue;
+            }
+            WorkflowStepEntity compensation = new WorkflowStepEntity();
+            compensation.setId(java.util.UUID.randomUUID());
+            compensation.setName(compensationName);
+            compensation.setPosition(nextPosition++);
+            compensation.setStatus(StepStatus.PENDING);
+            compensation.setAttempt(0);
+            instance.addStep(compensation);
+            entityManager.persist(compensation);
+            planned = true;
+        }
+        return planned;
+    }
+
+    /**
+     * Sets the forward step that {@code compensationName} undoes to {@code COMPENSATED}.
+     *
+     * @param instance aggregate in this transaction
+     * @param compensationName activity that just succeeded
+     */
+    private void markForwardCompensated(WorkflowInstanceEntity instance, String compensationName) {
+        WorkflowDefinition definition = definitions.findByType(instance.getType()).orElse(null);
+        if (definition == null || !isCompensation(definition, compensationName)) {
+            return;
+        }
+        String forwardName = definition.steps().stream()
+                .filter(step -> compensationName.equals(step.compensationName()))
+                .map(com.workflowengine.domain.StepDefinition::name)
+                .findFirst()
+                .orElse(null);
+        if (forwardName == null) {
+            return;
+        }
+        instance.getSteps().stream()
+                .filter(step -> forwardName.equals(step.getName()))
+                .findFirst()
+                .ifPresent(step -> step.setStatus(StepStatus.COMPENSATED));
+    }
+
+    private static boolean isCompensation(WorkflowDefinition definition, String stepName) {
+        return compensationName(definition, stepName) == null
+                && definition.steps().stream().anyMatch(step -> stepName.equals(step.compensationName()));
+    }
+
+    private static String compensationName(WorkflowDefinition definition, String forwardName) {
+        return definition.steps().stream()
+                .filter(step -> step.name().equals(forwardName))
+                .map(com.workflowengine.domain.StepDefinition::compensationName)
+                .findFirst()
+                .orElse(null);
+    }
+
+    private static Duration timeoutFor(WorkflowDefinition definition, String stepName) {
+        for (com.workflowengine.domain.StepDefinition step : definition.steps()) {
+            if (step.name().equals(stepName) || stepName.equals(step.compensationName())) {
+                return step.timeout();
+            }
+        }
+        return null;
+    }
+
+    private static boolean forwardOrCompensating(WorkflowStatus status) {
+        return status == WorkflowStatus.RUNNING || status == WorkflowStatus.COMPENSATING;
+    }
+
+    private boolean compensating(UUID workflowId) {
+        return instances.findById(workflowId)
+                .map(instance -> instance.getStatus() == WorkflowStatus.COMPENSATING)
+                .orElse(false);
+    }
+
     private static WorkflowStepEntity stepAt(WorkflowInstanceEntity instance, int position) {
         return instance.getSteps().stream()
                 .filter(step -> step.getPosition() == position)

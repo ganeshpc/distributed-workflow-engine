@@ -3,9 +3,11 @@ package com.workflowengine.api;
 /**
  * Lifecycle of one step row as stored on {@code workflow_step.status}.
  *
- * <p>Phase 1 uses the same four values as {@link WorkflowStatus}. Later
- * planned values ({@code TIMED_OUT}, {@code CANCELED}, {@code COMPENSATING})
- * are not added until a phase implements them.
+ * <p>The forward walk uses {@code PENDING}, {@code RUNNING}, {@code COMPLETED},
+ * and {@code FAILED}. Phase 7 sets a completed forward step to
+ * {@code COMPENSATED} when its compensation activity succeeds. Compensation
+ * activity rows themselves use the forward statuses. There is no
+ * {@code TIMED_OUT} or {@code CANCELED} step status.
  *
  * <p>A crash after a {@code RUNNING} commit leaves the step {@code RUNNING}
  * (a leftover). Phase 1 does not re-invoke it.
@@ -22,5 +24,11 @@ public enum StepStatus {
     COMPLETED,
 
     /** Activity returned {@code success=false}; {@code error} and {@code completed_at} are set. */
-    FAILED
+    FAILED,
+
+    /**
+     * A completed forward step whose compensation activity has committed
+     * success. {@code output_json} stays the forward output.
+     */
+    COMPENSATED
 }

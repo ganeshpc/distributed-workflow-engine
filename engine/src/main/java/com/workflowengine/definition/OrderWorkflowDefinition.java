@@ -11,9 +11,10 @@ import java.util.List;
 /**
  * Linear {@code ORDER} saga: create order, reserve inventory, pay, ship, notify.
  *
- * <p>Version is 1. Step names match in-process stub {@code Activity#name()}
- * values. Each step uses {@link RetryPolicy#defaults()} and
- * {@link #STEP_TIMEOUT}. The graph is immutable and a Spring singleton.
+ * <p>Version is 1. Each forward step names a compensation activity. A later
+ * forward failure walks the completed steps backward through those names.
+ * Each step uses {@link RetryPolicy#defaults()} and {@link #STEP_TIMEOUT}.
+ * The graph is immutable and a Spring singleton.
  *
  * <p>No failure handling of its own. The executor and the timeout poller
  * read this list; they do not modify it.
@@ -47,21 +48,22 @@ public final class OrderWorkflowDefinition implements WorkflowDefinition {
     @Override
     public List<StepDefinition> steps() {
         return List.of(
-                step("CREATE_ORDER"),
-                step("RESERVE_INVENTORY"),
-                step("PROCESS_PAYMENT"),
-                step("CREATE_SHIPMENT"),
-                step("SEND_NOTIFICATION")
+                step("CREATE_ORDER", "COMPENSATE_CREATE_ORDER"),
+                step("RESERVE_INVENTORY", "COMPENSATE_RESERVE_INVENTORY"),
+                step("PROCESS_PAYMENT", "COMPENSATE_PROCESS_PAYMENT"),
+                step("CREATE_SHIPMENT", "COMPENSATE_CREATE_SHIPMENT"),
+                step("SEND_NOTIFICATION", "COMPENSATE_SEND_NOTIFICATION")
         );
     }
 
     /**
-     * ORDER step with the shared retry policy and {@link #STEP_TIMEOUT}.
+     * ORDER step with the shared retry policy, {@link #STEP_TIMEOUT}, and a compensator.
      *
-     * @param name activity name
+     * @param name forward activity name
+     * @param compensationName activity that undoes {@code name}; not null
      * @return immutable step definition
      */
-    private static StepDefinition step(String name) {
-        return new StepDefinition(name, RetryPolicy.defaults(), STEP_TIMEOUT);
+    private static StepDefinition step(String name, String compensationName) {
+        return new StepDefinition(name, RetryPolicy.defaults(), STEP_TIMEOUT, compensationName);
     }
 }

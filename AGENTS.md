@@ -28,7 +28,7 @@ Honesty labels used in `docs/architecture.md`:
 - **Planned** — later increment. Do not start unless the user asked for that phase.
 - **Theoretical** — vocabulary only. Not committed.
 
-Current code is Phase 6 (PR-09): the engine commits `RUNNING`, publishes `activity.tasks`, and applies `activity.results`. One `worker` module runs the five stubs and stores a finished attempt in its own database. A redelivery of the same `(workflowId, step, attempt)` publishes the stored result and does not execute again. Republish keeps the same `attempt`. `FAILED` is not retried. Next planned increment is Phase 7 (compensation) when that phase is requested. Do not scaffold signals, timer steps, a second worker, or a designer "for later".
+Current code is Phase 7 (PR-10): the engine commits `RUNNING`, publishes `activity.tasks`, and applies `activity.results`. One `worker` module runs the forward stubs and their compensation stubs, and stores a finished attempt in its own database. A redelivery of the same `(workflowId, step, attempt)` publishes the stored result and does not execute again. A forward failure after completed steps walks those steps backward and ends `COMPENSATED`. A failure with nothing to undo stays `FAILED`. `FAILED` and `COMPENSATED` are not retried. Next planned increment is Phase 8 (optional worker split) when that phase is requested. Do not scaffold signals, timer steps, a second worker, or a designer "for later".
 
 ---
 
@@ -254,7 +254,7 @@ A new module follows this table on the day it is created. `engine-api` is the ex
 - Packages: `com.workflowengine.{layer}`.
 - HTTP records in `web`: `StartWorkflowRequest`, `WorkflowResponse`, `StepResponse`, `ErrorResponse`.
 - Domain snapshots in `engine-api`: `WorkflowSnapshot`, `StepSnapshot`.
-- Status enums: `PENDING`, `RUNNING`, `COMPLETED`, `FAILED`.
+- Status enums: `PENDING`, `RUNNING`, `COMPLETED`, `FAILED`, plus instance `COMPENSATING` / `COMPENSATED` and forward-step `COMPENSATED`.
 - Step names and workflow type `ORDER` are identifiers; do not rename them without a `definition_version` policy.
 
 ### Imports and dependencies

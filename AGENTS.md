@@ -65,7 +65,7 @@ Allowed: JDK types only. JSON travels as `String` (UTF-8 JSON text). Status enum
 
 Forbidden here: `WorkflowDefinition`, `StepDefinition`, JPA entities, Spring types, Jackson, HTTP DTOs that leak servlet/Jackson types.
 
-A future `worker` module must depend on `engine-api` only, never on `engine`.
+A worker module depends on `engine-api`, never on `engine`.
 
 ### `engine` package map
 
@@ -235,6 +235,7 @@ New migrations: `V{n}__{snake_description}.sql`. Never edit an applied `V1__init
 | Tests | JUnit Jupiter, AssertJ, Spring Boot test starters, Testcontainers. Do not mock PostgreSQL for state-machine tests. |
 
 A new module follows this table on the day it is created. `engine-api` is the exception, and it stays the exception.
+
 - Web starter is `spring-boot-starter-webmvc` (not `spring-boot-starter-web`). Flyway is `spring-boot-starter-flyway`. Tests use the matching `*-test` starters and Testcontainers 2 artifacts (`testcontainers-postgresql`, `testcontainers-junit-jupiter`).
 - `final` on fields that are not reassigned. Do not make entities `final` in a way that breaks Hibernate proxies if proxies appear later; current entities are concrete with no lazy-to-one graphs that require that.
 - Java 21 language is fine (records, text blocks, pattern matching for instanceof). Do not use preview features.
@@ -259,7 +260,7 @@ A new module follows this table on the day it is created. `engine-api` is the ex
 ### Imports and dependencies
 
 - `engine-api/pom.xml` has **no** dependencies beyond the JDK.
-- Every other module may use Jackson 3 where it reads or writes JSON, including Kafka values. Persistence still stores JSON as `String` + `jsonb` casts.
+- Every other module may use Jackson 3 where it reads or writes JSON, including Kafka values. Spring Kafka serializes `ActivityContext` and `ActivityCompletion`. Persistence still stores JSON as `String` + `jsonb` casts. `engine-api` does not depend on Jackson.
 - Do not add a dependency that the matching phase does not need.
 
 ---

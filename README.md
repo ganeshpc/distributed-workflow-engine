@@ -118,7 +118,7 @@ distributed-workflow-engine/     Maven aggregator; imports Spring Boot 4.1 BOM
   AGENTS.md                      Rules for humans and coding agents
 ```
 
-**`engine-api`** (`com.workflowengine.api`): `WorkflowStatus`, `StepStatus`, `StartWorkflowCommand`, `WorkflowSnapshot`, `StepSnapshot`, `Activity`, `ActivityContext`, `ActivityResult`. JSON travels as `String`. A future `worker` module must depend on this jar only.
+**`engine-api`** (`com.workflowengine.api`): `WorkflowStatus`, `StepStatus`, `StartWorkflowCommand`, `WorkflowSnapshot`, `StepSnapshot`, `Activity`, `ActivityContext`, `ActivityResult`. The worker depends on this jar, never on `engine`. Kafka listeners receive those records; Spring Kafka writes the JSON.
 
 **`engine` package map:**
 
@@ -500,7 +500,7 @@ Postgres remains the source of truth for orchestration metadata. Kafka, when it 
 |---|---|
 | `POST` / `GET` one workflow. No list, cancel, signal, `?wait=`. | Same admit-then-run. Later: signals `POST /workflows/{id}/signals/{name}`, maybe list/cancel. Still no Temporal query handlers. |
 | Linear `ORDER` in Java (`OrderWorkflowDefinition`). | Still Java definitions unless a later phase chooses otherwise. Branching, parallel+join, timer steps (Phase 10). Not BPMN, not a designer. |
-| JSON as `String` in `engine-api`; Jackson only at HTTP. | Unchanged contract so workers never depend on `engine`. |
+| Activity records in `engine-api`. Spring Kafka serializes them as JSON on the topics. | Workers depend on `engine-api`, not on `engine`. |
 
 ### Data that stays vs data that appears later
 

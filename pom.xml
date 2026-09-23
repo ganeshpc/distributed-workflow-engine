@@ -13,7 +13,6 @@
 
   <modules>
     <module>engine-api</module>
-    <module>engine-json</module>
     <module>worker</module>
     <module>engine</module>
   </modules>
@@ -40,11 +39,7 @@
         <artifactId>engine-api</artifactId>
         <version>${project.version}</version>
       </dependency>
-      <dependency>
-        <groupId>com.workflowengine</groupId>
-        <artifactId>engine-json</artifactId>
-        <version>${project.version}</version>
-      </dependency>
+
     </dependencies>
   </dependencyManagement>
 

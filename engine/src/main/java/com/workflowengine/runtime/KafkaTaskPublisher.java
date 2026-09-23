@@ -1,7 +1,6 @@
 package com.workflowengine.runtime;
 
 import com.workflowengine.api.activity.ActivityContext;
-import com.workflowengine.messaging.ActivityMessages;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Component;
@@ -21,15 +20,15 @@ import java.util.concurrent.TimeUnit;
 @Component
 public class KafkaTaskPublisher implements TaskPublisher {
 
-    private final KafkaTemplate<String, String> kafka;
+    private final KafkaTemplate<String, ActivityContext> kafka;
     private final String tasksTopic;
 
     /**
-     * @param kafka string producer configured by Spring Boot
+     * @param kafka producer; the value is the {@link ActivityContext} record, written as JSON by Spring Kafka
      * @param tasksTopic topic name, default {@code activity.tasks}
      */
     public KafkaTaskPublisher(
-            KafkaTemplate<String, String> kafka,
+            KafkaTemplate<String, ActivityContext> kafka,
             @Value("${workflow.dispatch.tasks-topic:activity.tasks}") String tasksTopic
     ) {
         this.kafka = kafka;
@@ -40,7 +39,7 @@ public class KafkaTaskPublisher implements TaskPublisher {
     @Override
     public void publish(ActivityContext task) {
         try {
-            kafka.send(tasksTopic, task.workflowId().toString(), ActivityMessages.taskJson(task))
+            kafka.send(tasksTopic, task.workflowId().toString(), task)
                     .get(10, TimeUnit.SECONDS);
         } catch (InterruptedException ex) {
             Thread.currentThread().interrupt();

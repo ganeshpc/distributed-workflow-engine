@@ -65,15 +65,37 @@ services:
       retries: 12
       start_period: 30s
 
+  worker-postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: worker
+      POSTGRES_USER: worker
+      POSTGRES_PASSWORD: worker
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - worker_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U worker -d worker"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   worker:
     build:
       context: .
       target: worker
     environment:
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+      SPRING_DATASOURCE_URL: jdbc:postgresql://worker-postgres:5432/worker
+      SPRING_DATASOURCE_USERNAME: worker
+      SPRING_DATASOURCE_PASSWORD: worker
     depends_on:
       kafka:
+        condition: service_healthy
+      worker-postgres:
         condition: service_healthy
 
 volumes:
   postgres_data:
+  worker_postgres_data:

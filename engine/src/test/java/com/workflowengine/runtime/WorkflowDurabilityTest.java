@@ -38,8 +38,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Crash leftover: a blocked worker is visible as {@code RUNNING} on a second
- * JDBC connection. A new engine republishes that same attempt. The worker
- * runs it again. {@code attempt} stays 1.
+ * JDBC connection. A new engine republishes that same attempt. The listener
+ * is still inside the first execute, so it stores the completion before it
+ * reads the republish. The second delivery does not execute. {@code attempt}
+ * stays 1.
  *
  * <p>Inserting a {@code RUNNING} row by hand is not a substitute.
  */
@@ -120,13 +122,7 @@ class WorkflowDurabilityTest {
             assertThat(done.getStatus()).isEqualTo(WorkflowStatus.COMPLETED);
             assertThat(done.getVersion()).isEqualTo(10);
             assertThat(done.getSteps().getFirst().getAttempt()).isEqualTo(1);
-
-            long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
-            while (CreateOrderActivity.invocationCount() < invocationsAfterBlock + 1
-                    && System.nanoTime() < deadline) {
-                Thread.sleep(25);
-            }
-            assertThat(CreateOrderActivity.invocationCount()).isGreaterThanOrEqualTo(invocationsAfterBlock + 1);
+            assertThat(CreateOrderActivity.invocationCount()).isEqualTo(invocationsAfterBlock);
         } finally {
             second.close();
             ActivityBlockHook.clear();

@@ -7,8 +7,9 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
  * One worker process for every ORDER activity.
  *
  * <p>Depends on {@code engine-api} only. It consumes {@code activity.tasks},
- * runs the stub, and publishes {@code activity.results}. It has no database
- * and does not decide the next step. Scan stays in this package so an engine
+ * runs the stub, and publishes {@code activity.results}. Its own database
+ * stores finished attempts so a redelivery does not run the stub again. It
+ * does not decide the next step. Scan stays in this package so an engine
  * test classpath cannot pick these beans up inside the engine context.
  *
  * <p>Process singleton. A missing broker fails startup. Activity failures

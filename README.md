@@ -4,7 +4,7 @@ A Java 21 / Spring Boot 4.1 workflow **orchestrator**. It coordinates a linear e
 
 This is **not** Temporal. There is no event-sourced history, no deterministic replay of workflow code, and no task-queue matching. The engine stores *where the saga is now* (`PENDING` / `RUNNING` / `COMPLETED` / `FAILED`) and commits each transition before it calls the next activity.
 
-**Current stage: Phase 5.** The engine and one worker process, plus Postgres and Kafka. The engine commits each step `RUNNING` and publishes a task. The worker runs the canned stub and publishes a result. A lost task is republished at the same attempt. A step past `deadline_at` fails with error `TIMED_OUT`. `FAILED` is not retried. Real side effects still wait for Phase 6 idempotency.
+**Current stage: Phase 6.** The engine and one worker process, plus Postgres, a separate worker Postgres, and Kafka. The engine commits each step `RUNNING` and publishes a task. The worker runs the canned stub once per attempt, stores that result, and publishes it. A redelivery of the same attempt publishes the stored result and does not run the stub again. A lost task is republished at the same attempt. A step past `deadline_at` fails with error `TIMED_OUT`. `FAILED` is not retried. The stubs are still canned JSON.
 
 The design contract is [`docs/architecture.md`](docs/architecture.md). Agent rules are in [`AGENTS.md`](AGENTS.md).
 
@@ -37,15 +37,15 @@ The design contract is [`docs/architecture.md`](docs/architecture.md). Agent rul
 
 ```text
 docker compose up -d --build
-# builds the engine and worker images, then starts Postgres, Kafka, and both processes
+# builds the engine and worker images, then starts Postgres, worker Postgres, Kafka, and both processes
 ```
 
-`http://localhost:8080` is the engine. Inside Compose the engine uses `postgres:5432` and the worker and engine use Kafka at `kafka:19092` (the broker's in-network listener). Host tools still use `localhost:9092`.
+`http://localhost:8080` is the engine. Inside Compose the engine uses `postgres:5432`, the worker uses `worker-postgres:5432`, and both use Kafka at `kafka:19092` (the broker's in-network listener). Host tools use `localhost:5432` for the engine database, `localhost:5433` for the worker database, and `localhost:9092` for Kafka.
 
 To run the processes on the host instead, start only the infrastructure and point the apps at localhost:
 
 ```text
-docker compose up -d postgres kafka
+docker compose up -d postgres worker-postgres kafka
 mvn -pl engine -am spring-boot:run
 # second terminal
 mvn -pl worker -am spring-boot:run
@@ -178,7 +178,7 @@ Demo failure injection on stubs only. If input JSON contains `"failAt":"PROCESS_
 
 ### At-least-once (Phase 2)
 
-Re-invoking a leftover `RUNNING` step can run the stub a second time. Stubs are not idempotent. Real side effects need Phase 6 (activity idempotency). Phase 2 makes **progress** after crash; it does not make side effects exactly-once.
+Re-invoking a leftover `RUNNING` step can run the stub a second time when that attempt is not stored yet. Phase 6 stores a finished attempt in the worker database, so a later delivery of the same attempt does not execute again. A crash during execute, before that row commits, can still run twice. Phase 2 makes **progress** after crash.
 
 ### Step timeout (Phase 3)
 
@@ -461,7 +461,7 @@ Postgres remains the source of truth for orchestration metadata. Kafka, when it 
 |---|---|---|
 | Processes | Engine JVM + one worker JVM | Optional split into service-owned workers (Phase 8). |
 | Compose | Postgres + Kafka | No five microservices. |
-| Who runs activities | Worker process implements `Activity` from `engine-api` | Still no card network or stock DB until Phase 6. |
+| Who runs activities | Worker process implements `Activity` from `engine-api` and skips a stored attempt | Stubs still return canned JSON. No card network or stock database. |
 | Engine replicas | `replicas > 1` is a defect | Allowed only after out-of-process activities (5), idempotent activities (6), and `SKIP LOCKED` claim (9). |
 
 ### How a step runs
@@ -475,7 +475,7 @@ Postgres remains the source of truth for orchestration metadata. Kafka, when it 
 5. Worker publishes a result keyed by `(workflowId, step, attempt)`.
 6. Engine result consumer applies the mid-step complete, workflow-complete, or step-fail transaction.
 
-**Later:** an outbox can replace the direct publish. Phase 6 makes the worker idempotent on that same key. The producer waits for the broker ack only. It does not wait for the activity result.
+**Now:** the worker skips execute when `(workflowId, step, attempt)` is already stored and publishes that result. The producer waits for the broker ack only. It does not wait for the activity result. An outbox can still replace the direct publish.
 
 ### Recovery
 
@@ -491,7 +491,7 @@ Postgres remains the source of truth for orchestration metadata. Kafka, when it 
 |---|---|---|
 | Time | Per-attempt `deadline_at` (ORDER: 5 minutes). Poller fails a due `RUNNING` step with `TIMED_OUT`. Backoff field exists; ORDER uses zero delay. | Phase 10: first-class timer *steps*. The poller is not that. |
 | Activity failure | Stub `failAt` or `success=false` → step-fail; instance `FAILED`; later steps stay `PENDING`. | Same forward fail, then **compensation** (Phase 7): reverse walk of completed steps, states `COMPENSATING` / `COMPENSATED`. Requires Phase 6. |
-| Double invoke after crash | Real: stub runs twice. Documented. Stubs have no money/stock. | Phase 6: worker idempotency store “this attempt already completed.” Effectively-once = at-least-once delivery + idempotent handler. **Hard gate** before real payment/inventory. |
+| Double invoke after crash | A delivery that arrives before the worker commits the attempt can run the stub again. After that row exists, the same attempt is not executed again. Stubs still have no money/stock. | Real payment and inventory calls use this store. A crash during execute, before the row commits, can still run twice. |
 | `failAt` | Worker honors it only when `spring.profiles.active=test`. | Unchanged. |
 
 ### API and definitions
@@ -604,6 +604,7 @@ Testcontainers starts its own `postgres:16`. You do not need Compose for tests.
 | `WorkflowPersistenceTest` | Flyway v2, unique keys, `@Version` starts at 0 |
 | `BodySizeFilterTest` | 64 KB cap without Spring |
 | `WorkflowExecutorPackageTest` | Executor bytecode does not name the stub package |
+| `ActivityIdempotencyTest` | Second delivery of the same attempt does not execute; a restarted worker republishes the stored result |
 
 Manual leftover checks (SQL plant + restart) are described in the Phase 2 PR discussion; automated tests are the gate.
 
@@ -618,7 +619,7 @@ Manual leftover checks (SQL plant + restart) are described in the Phase 2 PR dis
 | 3 | Done | Timeout poller: `deadline_at`, `FAILED` / `TIMED_OUT`, late completion discarded |
 | 4 | Skipped | The worker contract was already `Activity` in `engine-api` |
 | 5 | Done | Kafka plus one worker. Republish keeps the same attempt. |
-| 6 | Next | Activity idempotency (required before real side effects) |
+| 6 | Done | Worker stores a finished attempt and skips a second execute. |
 | 7+ | Planned | Compensation, optional worker split, multi-instance engine, signals, observability |
 
 Do not run `replicas > 1` until out-of-process activities (5), idempotent activities (6), and claim/lock (9) exist.

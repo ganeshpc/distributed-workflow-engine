@@ -28,7 +28,7 @@ Honesty labels used in `docs/architecture.md`:
 - **Planned** — later increment. Do not start unless the user asked for that phase.
 - **Theoretical** — vocabulary only. Not committed.
 
-Current code is Phase 5 (PR-08): the engine commits `RUNNING`, publishes `activity.tasks`, and applies `activity.results`. One `worker` module runs the five stubs. Republish keeps the same `attempt`. `FAILED` is not retried. Next planned increment is Phase 6 (activity idempotency) when that phase is requested. Do not scaffold compensation, signals, timer steps, a second worker, or a designer "for later".
+Current code is Phase 6 (PR-09): the engine commits `RUNNING`, publishes `activity.tasks`, and applies `activity.results`. One `worker` module runs the five stubs and stores a finished attempt in its own database. A redelivery of the same `(workflowId, step, attempt)` publishes the stored result and does not execute again. Republish keeps the same `attempt`. `FAILED` is not retried. Next planned increment is Phase 7 (compensation) when that phase is requested. Do not scaffold signals, timer steps, a second worker, or a designer "for later".
 
 ---
 
@@ -42,7 +42,7 @@ Current code is Phase 5 (PR-08): the engine commits `RUNNING`, publishes `activi
 | Persistence | PostgreSQL 16, Flyway SQL, Spring Data JPA |
 | API | REST JSON under `/api/v1` |
 | Tests | JUnit Jupiter (managed JUnit 6), AssertJ, Spring Boot Test, Testcontainers 2 PostgreSQL |
-| Local infra | `docker-compose.yml` — Postgres, Kafka, engine, and worker |
+| Local infra | `docker-compose.yml` — Postgres, worker Postgres, Kafka, engine, and worker |
 
 Do not add Spring Statemachine, Kafka, Redis, Elasticsearch, gRPC, Micrometer dashboards, or extra Compose services unless the matching phase is in progress.
 
@@ -53,7 +53,7 @@ Do not add Spring Statemachine, Kafka, Redis, Elasticsearch, gRPC, Micrometer da
 ```
 distributed-workflow-engine/     aggregator POM; Boot BOM; pluginManagement
   engine-api/                    JDK-only contracts (no Spring, JPA, Jackson, Kafka, Lombok)
-  worker/                        One Spring Boot process. Kafka consumer. Five stub activities.
+  worker/                        One Spring Boot process. Kafka consumer. Five stub activities. Own Postgres for finished attempts.
   engine/                        Spring Boot app + orchestration. Publishes tasks, applies results.
 ```
 
@@ -374,7 +374,8 @@ No Prometheus, Jaeger, ELK, or Zipkin in Compose until Phase 11.
 - `201` tests must pin the **admit snapshot**: `PENDING`, `version=0`, `currentStep=null`, all steps `PENDING`. Prove it with a blocked first stub while POST returns.
 - Poll `GET` (or repository load) until terminal with a ~5s timeout. Happy path: five `COMPLETED` in position order, `attempt = 1`, `version = 10`, `currentStep = SEND_NOTIFICATION`, instance output equals last step output.
 - `failAt=PROCESS_PAYMENT` and `failAt=CREATE_ORDER` plus unknown `failAt` are required scenarios when changing the executor or stubs.
-- Durability / recovery: block inside the worker `execute`; a **second DB connection** must see `RUNNING`. A **new** engine context against the same database republishes that task at the same `attempt`, and the worker runs it again. Inserting a `RUNNING` row by hand is not a substitute. A `FAILED` instance must not be retried after restart.
+- Durability / recovery: block inside the worker `execute`; a **second DB connection** must see `RUNNING`. A **new** engine context against the same database republishes that task at the same `attempt`. The in-flight call stores the completion before that republish is read, so the stub count does not increase, and the saga still finishes at `attempt` 1. Inserting a `RUNNING` row by hand is not a substitute. A `FAILED` instance must not be retried after restart.
+- Activity idempotency: after the worker has committed the attempt, a second delivery of the same task does not increment the stub counter and publishes the stored result. Prove it with Testcontainers Kafka, including a new worker process against the same worker database.
 - Timeout: move the engine `Clock` (do not `Thread.sleep` for the deadline). An in-flight step past `deadline_at` becomes `FAILED` with error `TIMED_OUT` and a late success must not overwrite it. A restarted process past `deadline_at` must not invoke again.
 - Concurrent admit with the same key: one instance, one executor submit. Test the unique-violation path, not only sequential SELECT-then-INSERT.
 - Idempotent `200` must not submit a second executor.
@@ -394,7 +395,7 @@ docker compose up -d --build
 # Postgres, Kafka, engine on 127.0.0.1:8080, and the worker
 ```
 
-Host-side `mvn spring-boot:run` stays available: `docker compose up -d postgres kafka`, then run `engine` and `worker` on the laptop. Those processes use `localhost:5432` and `localhost:9092`. Containers use `postgres:5432` and `kafka:19092`.
+Host-side `mvn spring-boot:run` stays available: `docker compose up -d postgres worker-postgres kafka`, then run `engine` and `worker` on the laptop. The engine uses `localhost:5432`. The worker uses `localhost:5433`. Both use `localhost:9092`. Containers use `postgres:5432`, `worker-postgres:5432`, and `kafka:19092`.
 
 Health: `curl -s http://localhost:8080/actuator/health` → `{"status":"UP"}`.
 

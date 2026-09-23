@@ -1,8 +1,7 @@
-package com.workflowengine.runtime;
+package com.workflowengine.messaging;
 
 import com.workflowengine.api.activity.ActivityCompletion;
 import com.workflowengine.api.activity.ActivityContext;
-import com.workflowengine.api.activity.ActivityMessages;
 import org.junit.jupiter.api.Test;
 
 import java.util.UUID;
@@ -11,7 +10,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * Round-trips the Phase 5 Kafka JSON codec, including embedded JSON and escapes.
+ * Round-trips the Kafka activity JSON, including embedded JSON and escapes.
  */
 class ActivityMessagesTest {
 

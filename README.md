@@ -112,13 +112,16 @@ There is no XA / two-phase commit between those domains.
 ```
 distributed-workflow-engine/     Maven aggregator; imports Spring Boot 4.1 BOM
   engine-api/                    JDK-only contracts (no Spring, JPA, Jackson, Lombok)
+  engine-json/                   Jackson codec for activity task and result strings
   engine/                        Spring Boot app: HTTP, admission, executor, scanner, stubs, JPA
   docker-compose.yml             Postgres 16 only
   docs/architecture.md           Design contract
   AGENTS.md                      Rules for humans and coding agents
 ```
 
-**`engine-api`** (`com.workflowengine.api`): `WorkflowStatus`, `StepStatus`, `StartWorkflowCommand`, `WorkflowSnapshot`, `StepSnapshot`, `Activity`, `ActivityContext`, `ActivityResult`. JSON travels as `String`. A future `worker` module must depend on this jar only.
+**`engine-api`** (`com.workflowengine.api`): `WorkflowStatus`, `StepStatus`, `StartWorkflowCommand`, `WorkflowSnapshot`, `StepSnapshot`, `Activity`, `ActivityContext`, `ActivityResult`. JSON travels as `String`. The worker depends on this jar and on `engine-json`, never on `engine`.
+
+**`engine-json`** turns those strings into task and result records with Jackson. It is the only activity JSON codec.
 
 **`engine` package map:**
 
@@ -500,7 +503,7 @@ Postgres remains the source of truth for orchestration metadata. Kafka, when it 
 |---|---|
 | `POST` / `GET` one workflow. No list, cancel, signal, `?wait=`. | Same admit-then-run. Later: signals `POST /workflows/{id}/signals/{name}`, maybe list/cancel. Still no Temporal query handlers. |
 | Linear `ORDER` in Java (`OrderWorkflowDefinition`). | Still Java definitions unless a later phase chooses otherwise. Branching, parallel+join, timer steps (Phase 10). Not BPMN, not a designer. |
-| JSON as `String` in `engine-api`; Jackson only at HTTP. | Unchanged contract so workers never depend on `engine`. |
+| JSON as `String` in `engine-api`. Jackson encodes activity messages in `engine-json`. | Workers depend on `engine-api` and `engine-json`, not on `engine`. |
 
 ### Data that stays vs data that appears later
 

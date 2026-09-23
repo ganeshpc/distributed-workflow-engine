@@ -53,6 +53,7 @@ Do not add Spring Statemachine, Kafka, Redis, Elasticsearch, gRPC, Micrometer da
 ```
 distributed-workflow-engine/     aggregator POM; Boot BOM; pluginManagement
   engine-api/                    JDK-only contracts (no Spring, JPA, Jackson, Kafka, Lombok)
+  engine-json/                   Jackson codec for activity task and result strings
   worker/                        One Spring Boot process. Kafka consumer. Five stub activities.
   engine/                        Spring Boot app + orchestration. Publishes tasks, applies results.
 ```
@@ -65,7 +66,7 @@ Allowed: JDK types only. JSON travels as `String` (UTF-8 JSON text). Status enum
 
 Forbidden here: `WorkflowDefinition`, `StepDefinition`, JPA entities, Spring types, Jackson, HTTP DTOs that leak servlet/Jackson types.
 
-A future `worker` module must depend on `engine-api` only, never on `engine`.
+A worker module depends on `engine-api` and `engine-json`, never on `engine`.
 
 ### `engine` package map
 
@@ -243,7 +244,7 @@ New migrations: `V{n}__{snake_description}.sql`. Never edit an applied `V1__init
 ### Imports and dependencies
 
 - `engine-api/pom.xml` has **no** dependencies beyond the JDK.
-- `engine` may use Jackson only at the web boundary. Persistence stores JSON as `String` + `jsonb` casts.
+- `engine` and `worker` use Jackson for HTTP JSON and for activity messages through `engine-json`. Persistence stores JSON as `String` + `jsonb` casts. `engine-api` does not depend on Jackson.
 - Do not add a dependency that the matching phase does not need.
 
 ---

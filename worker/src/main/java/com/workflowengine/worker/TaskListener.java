@@ -2,7 +2,7 @@ package com.workflowengine.worker;
 
 import com.workflowengine.api.activity.ActivityCompletion;
 import com.workflowengine.api.activity.ActivityContext;
-import com.workflowengine.api.activity.ActivityMessages;
+import com.workflowengine.messaging.ActivityMessages;
 import com.workflowengine.api.activity.ActivityResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;

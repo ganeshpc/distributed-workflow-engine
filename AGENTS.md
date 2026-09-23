@@ -212,13 +212,30 @@ New migrations: `V{n}__{snake_description}.sql`. Never edit an applied `V1__init
 ## Java and Spring style
 
 - Match existing code: 4-space indent, K&R braces, no wildcard imports except JUnit/MockMvc static imports in tests.
-- **Lombok in `engine` only.** `engine-api` remains JDK-only: no Lombok, no Spring, no Jackson.
+- **`engine-api` is the only JDK-only module.** Every other module uses Lombok and the other standard libraries in the next section. Do not copy the `engine-api` style into `engine`, `worker`, or a later module.
 - JPA entities: `@Getter` `@Setter` `@NoArgsConstructor`. Never `@Data` or `@EqualsAndHashCode` (identity is the UUID). DB-generated timestamps use `@Setter(AccessLevel.NONE)`.
-- Logging: `@Slf4j`. Do not declare `LoggerFactory` by hand in `engine`.
+- Logging: `@Slf4j`. Do not declare `LoggerFactory` by hand outside `engine-api`.
 - Simple constructor injection: `@RequiredArgsConstructor` on `final` fields. Keep an explicit constructor when it wraps `TransactionTemplate` or validates uniqueness at construction (`StartWorkflowService`, `WorkflowExecutor`, registries).
 - Constructor injection only. No field `@Autowired`. No setter injection.
 - Prefer `record` for immutable values (commands, snapshots, results, HTTP JSON records). JPA entities stay mutable classes. Lombok does not replace records.
-- Jackson 3 lives only in `engine` (`tools.jackson.*`). Annotations stay `com.fasterxml.jackson.annotation` if you add them. Do not import `com.fasterxml.jackson.databind`.
+- Jackson 3 (`tools.jackson.*`) in every module except `engine-api`. Annotations stay `com.fasterxml.jackson.annotation` if you add them. Do not import `com.fasterxml.jackson.databind`.
+
+### Standard libraries (every module except `engine-api`)
+
+`engine-api` stays a plain JDK jar: no Lombok, Spring, JPA, Jackson, or Kafka. Every other module uses the libraries this repository already chose. Do not hand-write a replacement.
+
+| Need | Use |
+|---|---|
+| Getters, setters, constructors, loggers | Lombok: `@Getter`, `@Setter`, `@NoArgsConstructor`, `@RequiredArgsConstructor`, `@Slf4j`. Never `@Data` or `@EqualsAndHashCode`. Do not write those members by hand. |
+| JSON | Jackson 3 (`tools.jackson.*`). Do not write a JSON parser or codec. |
+| Kafka task and result values | The `engine-api` records themselves. Spring Kafka `JacksonJsonSerializer` and `JacksonJsonDeserializer` (Jackson 3). Do not use the deprecated Jackson 2 `JsonSerializer` / `JsonDeserializer`. Do not build a field map and then turn it into a string. |
+| Persistence | Spring Data JPA and Flyway. Do not hand-roll a JDBC client for workflow state. |
+| Logging | SLF4J through `@Slf4j`. Do not use `System.out`, `System.err`, or `LoggerFactory`. |
+| HTTP | `spring-boot-starter-webmvc` and the existing controller records. Do not add a second web stack. |
+| Tests | JUnit Jupiter, AssertJ, Spring Boot test starters, Testcontainers. Do not mock PostgreSQL for state-machine tests. |
+
+A new module follows this table on the day it is created. `engine-api` is the exception, and it stays the exception.
+
 - Web starter is `spring-boot-starter-webmvc` (not `spring-boot-starter-web`). Flyway is `spring-boot-starter-flyway`. Tests use the matching `*-test` starters and Testcontainers 2 artifacts (`testcontainers-postgresql`, `testcontainers-junit-jupiter`).
 - `final` on fields that are not reassigned. Do not make entities `final` in a way that breaks Hibernate proxies if proxies appear later; current entities are concrete with no lazy-to-one graphs that require that.
 - Java 21 language is fine (records, text blocks, pattern matching for instanceof). Do not use preview features.
@@ -243,7 +260,7 @@ New migrations: `V{n}__{snake_description}.sql`. Never edit an applied `V1__init
 ### Imports and dependencies
 
 - `engine-api/pom.xml` has **no** dependencies beyond the JDK.
-- `engine` and `worker` use Jackson at the HTTP boundary and, through Spring Kafka, to send `ActivityContext` and `ActivityCompletion` on the topics. Persistence stores JSON as `String` + `jsonb` casts. `engine-api` does not depend on Jackson.
+- Every other module may use Jackson 3 where it reads or writes JSON, including Kafka values. Spring Kafka serializes `ActivityContext` and `ActivityCompletion`. Persistence still stores JSON as `String` + `jsonb` casts. `engine-api` does not depend on Jackson.
 - Do not add a dependency that the matching phase does not need.
 
 ---

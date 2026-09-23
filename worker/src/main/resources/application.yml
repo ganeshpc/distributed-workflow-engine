@@ -1,6 +1,16 @@
 spring:
   main:
     web-application-type: none
+  datasource:
+    url: jdbc:postgresql://localhost:5433/worker
+    username: worker
+    password: worker
+  jpa:
+    hibernate:
+      ddl-auto: none
+  flyway:
+    enabled: true
+    locations: classpath:db/worker
   kafka:
     bootstrap-servers: localhost:9092
     consumer:
@@ -17,6 +27,8 @@ spring:
       acks: all
 
 workflow:
+  worker:
+    consumer-group: workflow-worker-tasks
   dispatch:
     tasks-topic: activity.tasks
     results-topic: activity.results

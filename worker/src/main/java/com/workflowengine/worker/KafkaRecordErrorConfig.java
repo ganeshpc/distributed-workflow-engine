@@ -1,7 +1,6 @@
 package com.workflowengine.worker;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.kafka.listener.CommonErrorHandler;
@@ -18,9 +17,8 @@ import org.springframework.kafka.listener.DefaultErrorHandler;
  * <p>Process-wide singleton. Runs on the Kafka listener thread.
  */
 @Configuration
+@Slf4j
 public class KafkaRecordErrorConfig {
-
-    private static final Logger log = LoggerFactory.getLogger(KafkaRecordErrorConfig.class);
 
     /**
      * @return error handler that does not retry a record that failed to deserialize

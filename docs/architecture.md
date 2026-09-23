@@ -4,9 +4,9 @@
 |---|---|
 | **Author** | Engineering |
 | **Date** | 2026-09-13 |
-| **Status** | Draft. Phases 1–3 are implemented. Later phases stay Planned. Where an early section still says Phase 1 is the next slice, [Incremental Roadmap](#incremental-roadmap) is the status to follow. |
+| **Status** | Draft. Phases 1–3, 5, and 6 are implemented. Phase 4 was skipped. Later phases stay Planned. Where an early section still says Phase 1 is the next slice, [Incremental Roadmap](#incremental-roadmap) is the status to follow. |
 | **Type** | Architecture + incremental implementation plan |
-| **Code in this revision** | The original review draft contained no code. The repository now contains Phases 1–3. |
+| **Code in this revision** | The original review draft contained no code. The repository now contains Phases 1–3, 5, and 6. |
 
 Honesty labels used throughout:
 
@@ -782,7 +782,7 @@ Demo-only. Each stub: if the workflow input JSON has `"failAt":"<this stub's nam
 | **Phase 2** | One engine process | Postgres | In-process; recovery may re-invoke `RUNNING` steps and start `PENDING` instances | Same | At-least-once steps; stubs still non-idempotent (documented). Terminal `FAILED` is **not** retried until a retry policy exists. |
 | **Phase 3** | One engine process | Postgres | In-process. A poller may fail a `RUNNING` step while `execute` is still on the executor thread | Same | Due `deadline_at` → `FAILED` with error `TIMED_OUT`. Not retried. Late completion is discarded. |
 | **Phase 5** | Engine + one worker | Postgres (orchestration), Kafka (transport) | Async, at-least-once delivery | Same | Lost messages recovered by scanner; **Planned** outbox if persist-then-publish drops a publish |
-| **Phase 6** | Same | Same | Worker idempotency on `(workflowId, step, attempt)` | Same | Effectively-once *business* effects |
+| **Phase 6** | Engine + one worker | Postgres (orchestration and a separate worker database), Kafka (transport) | Worker skips execute when `(workflowId, step, attempt)` is already stored, and republishes that result | Same | Effectively-once for a finished attempt. A crash before that row is committed can still execute again |
 | **Phase 9** | N engines | Postgres | Workers only; engines never run stubs | Same + row claim | `@Version` + `SKIP LOCKED` become load-bearing |
 
 **Two consistency domains, always:**
@@ -1112,13 +1112,19 @@ If Phase 1 review finds the seam already clean, this phase is a thin PR or a ski
 
 Concepts: at-least-once delivery, correlation by `(workflowId, step, attempt)`.
 
-### Phase 6 — Activity idempotency + explicit at-least-once (**Planned**)
+### Phase 6 — Activity idempotency + explicit at-least-once (**implemented**, PR-09)
 
-- Worker persists "I already completed this attempt."
-- Tests using Testcontainers Kafka + forced redelivery.
-- **Hard prerequisite** for any later PR that points activities at real side effects (payment, inventory).
+The worker database (not the engine database) stores one row per finished attempt. The correlation id is `(workflowId, stepName, attempt)`, already present on the task and the result. There is no second id and no engine-schema change.
 
-Concepts: effectively-once = at-least-once + idempotent handler.
+- `activity_completion` primary key is that triple. Flyway for the worker lives in `classpath:db/worker` so the engine migrator does not see it.
+- The listener loads the row first. A hit publishes the stored success, output, and error and does not call `Activity.execute`.
+- A miss executes, then commits the row, then publishes the committed row. Execute is not inside the completion transaction.
+- Two deliveries that both miss may both execute. The primary key keeps one row. The loser publishes the stored winner.
+- A crash after the commit and before the publish is recovered by the next delivery, which does not execute.
+- A crash during execute, before the commit, still executes again. That is the remaining at-least-once window. Real payment or inventory calls are still not in this phase; the stubs stay canned JSON. The store is the gate those calls must use.
+- Tests publish the same task twice through Testcontainers Kafka, including after a new worker process against the same database. The invocation count stays 1 and the second result payload equals the first.
+
+Concepts: effectively-once for a finished attempt = at-least-once delivery + idempotent handler.
 
 ### Phase 7 — Compensation / saga rollback (**Planned**)
 
@@ -1467,7 +1473,7 @@ Do not open a PR that scaffolds unused worker services, Kafka, or a designer.
 - **Depends on:** PR-05 (need a scanner to republish) and preferably PR-07 if it landed
 - **Description:** First extra process. **One** worker JVM, all activity types. No five-service split.
 
-### PR-09 — Activity idempotency (**Phase 6**)
+### PR-09 — Activity idempotency (**Phase 6**, **implemented**)
 
 - **Title:** Make at-least-once activity execution safe
 - **Files/components:** worker-side idempotency store; engine correlation ids; redelivery tests

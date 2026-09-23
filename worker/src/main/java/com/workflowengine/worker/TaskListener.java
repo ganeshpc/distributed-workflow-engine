@@ -2,11 +2,9 @@ package com.workflowengine.worker;
 
 import com.workflowengine.api.activity.ActivityCompletion;
 import com.workflowengine.api.activity.ActivityContext;
-import com.workflowengine.api.activity.ActivityMessages;
 import com.workflowengine.api.activity.ActivityResult;
 import com.workflowengine.worker.idempotency.ActivityIdempotencyStore;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
@@ -24,31 +22,31 @@ import java.util.concurrent.TimeUnit;
  * only after this method returns, so a crash before the commit redelivers and
  * may execute again. A crash after the commit republishes without executing.
  *
- * <p>The consumer group is {@code workflow-worker-tasks}, not the engine
- * results group. A malformed payload is logged and skipped so one bad record
- * cannot block the partition. Activity failure is a normal result message.
- * Runs on the Kafka listener thread. One process, concurrency 1 by default.
+ * <p>Spring Kafka passes the {@link ActivityContext} in. A value that is not
+ * that record is logged and skipped by the consumer error handler. The
+ * consumer group is {@code workflow-worker-tasks}, not the engine results
+ * group. Activity failure is a normal result message. Runs on the Kafka
+ * listener thread. One process, concurrency 1 by default.
  */
 @Component
+@Slf4j
 public class TaskListener {
-
-    private static final Logger log = LoggerFactory.getLogger(TaskListener.class);
 
     private final WorkerActivityInvoker invoker;
     private final ActivityIdempotencyStore completions;
-    private final KafkaTemplate<String, String> kafka;
+    private final KafkaTemplate<String, ActivityCompletion> kafka;
     private final String resultsTopic;
 
     /**
      * @param invoker local activity lookup; not called when the attempt is already stored
      * @param completions worker record of finished attempts
-     * @param kafka result producer; the broker ack is not the engine's result transaction
+     * @param kafka result producer; the value is the {@link ActivityCompletion} record
      * @param resultsTopic {@code activity.results}
      */
     public TaskListener(
             WorkerActivityInvoker invoker,
             ActivityIdempotencyStore completions,
-            KafkaTemplate<String, String> kafka,
+            KafkaTemplate<String, ActivityCompletion> kafka,
             @Value("${workflow.dispatch.results-topic:activity.results}") String resultsTopic
     ) {
         this.invoker = invoker;
@@ -60,20 +58,13 @@ public class TaskListener {
     /**
      * Handles one task record.
      *
-     * @param payload JSON task; may be malformed
+     * @param task deserialized task; not null when Spring Kafka invokes this method
      */
     @KafkaListener(
             topics = "${workflow.dispatch.tasks-topic:activity.tasks}",
             groupId = "${workflow.worker.consumer-group:workflow-worker-tasks}"
     )
-    public void onTask(String payload) {
-        ActivityContext task;
-        try {
-            task = ActivityMessages.task(payload);
-        } catch (RuntimeException ex) {
-            log.error("discard malformed task", ex);
-            return;
-        }
+    public void onTask(ActivityContext task) {
         ActivityCompletion stored = completions
                 .find(task.workflowId(), task.stepName(), task.attempt())
                 .orElse(null);
@@ -92,7 +83,7 @@ public class TaskListener {
 
     private void publish(ActivityContext task, ActivityCompletion completion) {
         try {
-            kafka.send(resultsTopic, task.workflowId().toString(), ActivityMessages.resultJson(completion))
+            kafka.send(resultsTopic, task.workflowId().toString(), completion)
                     .get(10, TimeUnit.SECONDS);
         } catch (InterruptedException ex) {
             Thread.currentThread().interrupt();

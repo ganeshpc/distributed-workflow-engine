@@ -1,7 +1,7 @@
 package com.workflowengine.worker;
 
 import com.workflowengine.api.activity.ActivityContext;
-import com.workflowengine.api.activity.ActivityMessages;
+import org.springframework.kafka.support.serializer.JacksonJsonSerializer;
 import com.workflowengine.worker.activity.CreateOrderActivity;
 import com.workflowengine.worker.activity.StubInvocationCounters;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
@@ -78,14 +78,14 @@ class ActivityIdempotencyTest {
     void secondDeliveryPublishesTheStoredResultWithoutExecuting() throws Exception {
         ActivityContext task = task();
         try (KafkaConsumer<String, String> results = resultsConsumer();
-             KafkaProducer<String, String> tasks = taskProducer()) {
+             KafkaProducer<String, ActivityContext> tasks = taskProducer()) {
             results.subscribe(List.of("activity.results"));
-            tasks.send(new ProducerRecord<>("activity.tasks", task.workflowId().toString(), ActivityMessages.taskJson(task)))
+            tasks.send(new ProducerRecord<>("activity.tasks", task.workflowId().toString(), task))
                     .get();
             String first = awaitResult(results);
             assertThat(CreateOrderActivity.invocationCount()).isEqualTo(1);
 
-            tasks.send(new ProducerRecord<>("activity.tasks", task.workflowId().toString(), ActivityMessages.taskJson(task)))
+            tasks.send(new ProducerRecord<>("activity.tasks", task.workflowId().toString(), task))
                     .get();
             String second = awaitResult(results);
             assertThat(CreateOrderActivity.invocationCount()).isEqualTo(1);
@@ -97,9 +97,9 @@ class ActivityIdempotencyTest {
     void restartedWorkerReplaysTheStoredResult() throws Exception {
         ActivityContext task = task();
         try (KafkaConsumer<String, String> results = resultsConsumer();
-             KafkaProducer<String, String> tasks = taskProducer()) {
+             KafkaProducer<String, ActivityContext> tasks = taskProducer()) {
             results.subscribe(List.of("activity.results"));
-            tasks.send(new ProducerRecord<>("activity.tasks", task.workflowId().toString(), ActivityMessages.taskJson(task)))
+            tasks.send(new ProducerRecord<>("activity.tasks", task.workflowId().toString(), task))
                     .get();
             String first = awaitResult(results);
             assertThat(CreateOrderActivity.invocationCount()).isEqualTo(1);
@@ -107,7 +107,7 @@ class ActivityIdempotencyTest {
             worker.close();
             worker = startWorker();
 
-            tasks.send(new ProducerRecord<>("activity.tasks", task.workflowId().toString(), ActivityMessages.taskJson(task)))
+            tasks.send(new ProducerRecord<>("activity.tasks", task.workflowId().toString(), task))
                     .get();
             String second = awaitResult(results);
             assertThat(CreateOrderActivity.invocationCount()).isEqualTo(1);
@@ -139,11 +139,11 @@ class ActivityIdempotencyTest {
         );
     }
 
-    private KafkaProducer<String, String> taskProducer() {
+    private KafkaProducer<String, ActivityContext> taskProducer() {
         Properties properties = new Properties();
         properties.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, kafka.getBootstrapServers());
         properties.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
-        properties.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        properties.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, JacksonJsonSerializer.class);
         properties.put(ProducerConfig.ACKS_CONFIG, "all");
         return new KafkaProducer<>(properties);
     }

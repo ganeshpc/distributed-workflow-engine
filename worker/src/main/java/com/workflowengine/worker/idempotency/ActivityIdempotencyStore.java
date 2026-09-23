@@ -3,8 +3,7 @@ package com.workflowengine.worker.idempotency;
 import com.workflowengine.api.activity.ActivityCompletion;
 import com.workflowengine.api.activity.ActivityContext;
 import com.workflowengine.api.activity.ActivityResult;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -32,9 +31,8 @@ import java.util.UUID;
  * database fails the insert and the listener does not acknowledge the task.
  */
 @Component
+@Slf4j
 public class ActivityIdempotencyStore {
-
-    private static final Logger log = LoggerFactory.getLogger(ActivityIdempotencyStore.class);
 
     private final ActivityCompletionRepository completions;
     private final TransactionTemplate tx;

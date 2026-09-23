@@ -5,6 +5,10 @@ import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
 import jakarta.persistence.IdClass;
 import jakarta.persistence.Table;
+import lombok.AccessLevel;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
 
 import java.time.Instant;
 import java.util.UUID;
@@ -19,9 +23,13 @@ import java.util.UUID;
  * JSON text, stored as text so this process does not share the engine schema.
  *
  * <p>Mutable JPA entity. The listener thread inserts it. Two deliveries can
- * race the insert; the primary key keeps one row. No {@code @Version}. The
- * worker does not use Lombok.
+ * race the insert; the primary key keeps one row. No {@code @Version}.
+ * Lombok generates the accessors. {@code completedAt} is assigned by
+ * PostgreSQL and has no setter.
  */
+@Getter
+@Setter
+@NoArgsConstructor
 @Entity
 @Table(name = "activity_completion")
 @IdClass(ActivityCompletionKey.class)
@@ -48,97 +56,7 @@ public class ActivityCompletionEntity {
     @Column(name = "error")
     private String error;
 
+    @Setter(AccessLevel.NONE)
     @Column(name = "completed_at", nullable = false, insertable = false, updatable = false)
     private Instant completedAt;
-
-    /**
-     * @return instance id
-     */
-    public UUID getWorkflowId() {
-        return workflowId;
-    }
-
-    /**
-     * @param workflowId instance id
-     */
-    public void setWorkflowId(UUID workflowId) {
-        this.workflowId = workflowId;
-    }
-
-    /**
-     * @return step name
-     */
-    public String getStepName() {
-        return stepName;
-    }
-
-    /**
-     * @param stepName step name
-     */
-    public void setStepName(String stepName) {
-        this.stepName = stepName;
-    }
-
-    /**
-     * @return attempt number
-     */
-    public int getAttempt() {
-        return attempt;
-    }
-
-    /**
-     * @param attempt attempt number
-     */
-    public void setAttempt(int attempt) {
-        this.attempt = attempt;
-    }
-
-    /**
-     * @return whether the stored activity result succeeded
-     */
-    public boolean isSuccess() {
-        return success;
-    }
-
-    /**
-     * @param success activity success flag
-     */
-    public void setSuccess(boolean success) {
-        this.success = success;
-    }
-
-    /**
-     * @return stored output JSON text, or null
-     */
-    public String getOutputJson() {
-        return outputJson;
-    }
-
-    /**
-     * @param outputJson output JSON text, or null
-     */
-    public void setOutputJson(String outputJson) {
-        this.outputJson = outputJson;
-    }
-
-    /**
-     * @return stored error text, or null
-     */
-    public String getError() {
-        return error;
-    }
-
-    /**
-     * @param error error text, or null
-     */
-    public void setError(String error) {
-        this.error = error;
-    }
-
-    /**
-     * @return database clock when the row was inserted; null before the first flush reload
-     */
-    public Instant getCompletedAt() {
-        return completedAt;
-    }
 }

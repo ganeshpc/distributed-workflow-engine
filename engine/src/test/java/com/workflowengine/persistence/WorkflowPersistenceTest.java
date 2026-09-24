@@ -70,7 +70,7 @@ class WorkflowPersistenceTest {
 
     @Test
     void persistsInstanceWithFiveStepsAndReloads() {
-        assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("4");
+        assertThat(flyway.info().current().getVersion().getVersion()).isEqualTo("5");
 
         String idempotencyKey = "order-" + UUID.randomUUID();
         WorkflowInstanceEntity saved = persistOrderInstance(idempotencyKey);

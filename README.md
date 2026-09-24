@@ -2,9 +2,9 @@
 
 A Java 21 / Spring Boot 4.1 workflow engine. The product aim is a **production-ready Temporal clone**: event-sourced history, deterministic replay of workflow code, task-queue matching, durable timers, signals, query handlers, and worker SDKs.
 
-The code through Phase 7 is the current-state core of that system. It coordinates a linear e-commerce **ORDER** saga (create order → reserve inventory → process payment → create shipment → send notification) and stores *where the saga is now* in PostgreSQL. Each transition commits before the next activity. History and replay are not in this revision.
+The code through Phase 7 is the current-state core of that system. It coordinates a linear e-commerce **ORDER** saga (create order → reserve inventory → process payment → create shipment → send notification) and stores *where the saga is now* in PostgreSQL. Each transition commits before the next activity and appends a history event in that same transaction. Workflow code is not replayed in this revision.
 
-**Current stage: Phase 7.** The engine and one worker process, plus Postgres, a separate worker Postgres, and Kafka. The worker runs each canned stub once per attempt. A forward failure after completed steps walks those steps backward and ends `COMPENSATED`. A failure with nothing to undo stays `FAILED`. The stubs are still canned JSON.
+**Current stage: Phase 13.** The history log is `workflow_event`. `GET` still reads the instance and step rows. The engine and one worker process, plus Postgres, a separate worker Postgres, and Kafka. The worker runs each canned stub once per attempt. A forward failure after completed steps walks those steps backward and ends `COMPENSATED`. A failure with nothing to undo stays `FAILED`. The stubs are still canned JSON.
 
 The design contract is [`docs/architecture.md`](docs/architecture.md). Agent rules are in [`AGENTS.md`](AGENTS.md). The class-by-class path from `POST /api/v1/workflows` is in [`engine/code-flow.md`](engine/code-flow.md).
 

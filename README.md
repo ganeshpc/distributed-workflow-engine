@@ -6,7 +6,7 @@ This is **not** Temporal. There is no event-sourced history, no deterministic re
 
 **Current stage: Phase 7.** The engine and one worker process, plus Postgres, a separate worker Postgres, and Kafka. The worker runs each canned stub once per attempt. A forward failure after completed steps walks those steps backward and ends `COMPENSATED`. A failure with nothing to undo stays `FAILED`. The stubs are still canned JSON.
 
-The design contract is [`docs/architecture.md`](docs/architecture.md). Agent rules are in [`AGENTS.md`](AGENTS.md).
+The design contract is [`docs/architecture.md`](docs/architecture.md). Agent rules are in [`AGENTS.md`](AGENTS.md). The class-by-class path from `POST /api/v1/workflows` is in [`engine/README.md`](engine/README.md).
 
 ---
 
@@ -277,6 +277,8 @@ Crash after first step-start (`version=1`, step 0 `RUNNING`, `attempt=1`). Scann
 ---
 
 ## Step-by-step code flow
+
+Diagrams of the same path, with the class that owns each decision, are in [`engine/README.md`](engine/README.md).
 
 ### A. `POST /api/v1/workflows` (request thread)
 

@@ -14,17 +14,17 @@ Postgres is the source of truth. Each transition commits before the next publish
 
 ```mermaid
 flowchart TD
-  post["Client POST /api/v1/workflows"]
-  filter["BodySizeFilter<br/>POST, PUT, and PATCH under /api/<br/>Content-Length or counted bytes over 65536 returns 413"]
-  ctrl["WorkflowController.start<br/>Requires an object input<br/>Jackson 3 writes input to a JSON string<br/>Builds StartWorkflowCommand"]
-  validate["StartWorkflowService.validate<br/>WorkflowDefinitionRegistry.findByType<br/>ORDER only, via OrderWorkflowDefinition<br/>idempotencyKey length 1..128<br/>inputJson required"]
-  bad["RestExceptionHandler<br/>400 Bad Request<br/>503 when Postgres is unreachable<br/>Generic body, no SQL"]
-  admit["StartWorkflowService.insert<br/>Admit transaction<br/>New UUID, definition_version 1<br/>Instance PENDING, version 0, current_step null<br/>Five steps PENDING, attempt 0, position 0..4<br/>WorkflowInstanceRepository.saveAndFlush"]
-  race{"Unique index<br/>uq_workflow_instance_idempotency_key"}
-  existing["Reload by idempotency key<br/>AdmissionResult created false<br/>WorkflowResponses.from<br/>HTTP 200 current snapshot<br/>Dispatcher is not called"]
-  submit["WorkflowDispatcher.submit<br/>Inflight set rejects a second submit<br/>workflowTaskExecutor runs the rest<br/>Threads are named workflow-"]
-  created["HTTP 201<br/>Location /api/v1/workflows/id<br/>Body is the in-memory admit snapshot<br/>Still PENDING, version 0"]
-  run["WorkflowExecutor.run"]
+  post["Client<br/>POST /api/v1/workflows"]
+  filter["BodySizeFilter.doFilterInternal<br/>web/BodySizeFilter.java<br/>POST, PUT, and PATCH under /api/<br/>Content-Length or counted bytes over 65536 returns 413"]
+  ctrl["WorkflowController.start<br/>web/WorkflowController.java<br/>toCommand requires an object input<br/>Jackson 3 writes input to a JSON string<br/>Builds StartWorkflowCommand"]
+  validate["StartWorkflowService.validate<br/>application/StartWorkflowService.java<br/>WorkflowDefinitionRegistry.findByType<br/>domain/WorkflowDefinitionRegistry.java<br/>ORDER only, via OrderWorkflowDefinition<br/>definition/OrderWorkflowDefinition.java<br/>idempotencyKey length 1..128<br/>inputJson required"]
+  bad["RestExceptionHandler.badRequest<br/>web/RestExceptionHandler.java<br/>InvalidStartWorkflowException becomes 400<br/>Database unreachable becomes 503<br/>Generic body, no SQL"]
+  admit["StartWorkflowService.insert<br/>application/StartWorkflowService.java<br/>Admit transaction<br/>New UUID, definition_version 1<br/>Instance PENDING, version 0, current_step null<br/>Five steps PENDING, attempt 0, position 0..4<br/>WorkflowInstanceRepository.saveAndFlush<br/>persistence/WorkflowInstanceRepository.java"]
+  race{"StartWorkflowService.start<br/>application/StartWorkflowService.java<br/>DataIntegrityViolationException<br/>on uq_workflow_instance_idempotency_key"}
+  existing["StartWorkflowService.start<br/>application/StartWorkflowService.java<br/>WorkflowInstanceRepository.findByIdempotencyKey<br/>AdmissionResult created false<br/>application/AdmissionResult.java<br/>WorkflowController returns 200<br/>WorkflowResponses.from<br/>web/WorkflowResponses.java<br/>Dispatcher is not called"]
+  submit["WorkflowDispatcher.submit<br/>runtime/WorkflowDispatcher.java<br/>Inflight set rejects a second submit<br/>WorkflowExecutionConfig.workflowTaskExecutor<br/>config/WorkflowExecutionConfig.java<br/>Threads are named workflow-"]
+  created["WorkflowController.start<br/>web/WorkflowController.java<br/>HTTP 201 and Location /api/v1/workflows/id<br/>WorkflowResponses.from of the admit snapshot<br/>Still PENDING, version 0"]
+  run["WorkflowExecutor.run<br/>runtime/WorkflowExecutor.java"]
 
   post --> filter --> ctrl --> validate
   validate -->|"invalid type, key, or input"| bad
@@ -44,16 +44,16 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-  run["WorkflowExecutor.execute<br/>One transaction, then publish outside it"]
-  choose["choose<br/>Load the instance with steps<br/>Stop when status is COMPLETED, FAILED, or COMPENSATED<br/>Resolve the definition"]
-  walk["Walk steps by position<br/>Skip COMPLETED, COMPENSATED, and FAILED<br/>While COMPENSATING, also skip forward steps"]
-  start["startStep<br/>Step PENDING to RUNNING, attempt plus 1<br/>deadline_at = clock plus STEP_TIMEOUT<br/>next_attempt_at = clock plus republish-after-ms<br/>Instance RUNNING, unless it is already COMPENSATING<br/>current_step = this step<br/>started_at = PostgreSQL now()"]
-  due{"RUNNING step"}
-  timeout["failStep with error TIMED_OUT<br/>attempt stays the same<br/>Nothing is published<br/>COMPENSATING waits for RecoveryScanner"]
-  wait["next_attempt_at is still in the future<br/>Nothing is published"]
-  again["republishIfDue<br/>Same attempt, no new write"]
-  task["ActivityContext<br/>workflow id, type, definition version<br/>step name, attempt<br/>workflowInputJson from input_json<br/>stepInputJson null"]
-  kafka["KafkaTaskPublisher.publish<br/>Topic activity.tasks<br/>Key is the workflow id<br/>JacksonJsonSerializer writes the record<br/>acks all, wait up to 10 seconds"]
+  run["WorkflowExecutor.execute<br/>runtime/WorkflowExecutor.java<br/>One transaction, then publish outside it"]
+  choose["WorkflowExecutor.choose<br/>runtime/WorkflowExecutor.java<br/>WorkflowInstanceRepository.findById<br/>Stop when status is COMPLETED, FAILED, or COMPENSATED<br/>WorkflowDefinitionRegistry.findByType"]
+  walk["WorkflowExecutor.choose<br/>runtime/WorkflowExecutor.java<br/>Walk WorkflowStepEntity rows by position<br/>Skip COMPLETED, COMPENSATED, and FAILED<br/>While COMPENSATING, skip steps that are not compensators"]
+  start["WorkflowExecutor.startStep<br/>runtime/WorkflowExecutor.java<br/>Step PENDING to RUNNING, attempt plus 1<br/>deadline_at = Clock plus OrderWorkflowDefinition.STEP_TIMEOUT<br/>next_attempt_at = Clock plus republish-after-ms<br/>Instance RUNNING, unless it is already COMPENSATING<br/>current_step = this step<br/>started_at = PostgreSQL now()"]
+  due{"WorkflowExecutor.republishIfDue<br/>runtime/WorkflowExecutor.java<br/>Step is RUNNING"}
+  timeout["WorkflowExecutor.failStep<br/>runtime/WorkflowExecutor.java<br/>Called from republishIfDue<br/>error TIMED_OUT, attempt unchanged<br/>Returns null, so nothing is published<br/>COMPENSATING waits for RecoveryScanner"]
+  wait["WorkflowExecutor.republishIfDue<br/>runtime/WorkflowExecutor.java<br/>next_attempt_at is still in the future<br/>Returns null, nothing is published"]
+  again["WorkflowExecutor.republishIfDue<br/>runtime/WorkflowExecutor.java<br/>Same attempt, no new write"]
+  task["WorkflowExecutor.contextFor<br/>runtime/WorkflowExecutor.java<br/>Builds api.activity.ActivityContext<br/>engine-api/src/main/java/com/workflowengine/api/activity/ActivityContext.java<br/>workflow id, type, definition version, step, attempt<br/>workflowInputJson from input_json<br/>stepInputJson null"]
+  kafka["KafkaTaskPublisher.publish<br/>runtime/KafkaTaskPublisher.java<br/>Topic activity.tasks<br/>Key is the workflow id<br/>JacksonJsonSerializer writes ActivityContext<br/>acks all, wait up to 10 seconds"]
 
   run --> choose --> walk
   walk -->|"next step is PENDING"| start --> task --> kafka
@@ -71,23 +71,23 @@ The worker is a separate process. It is on this path because the engine's next c
 
 ```mermaid
 flowchart TD
-  task["activity.tasks"]
-  listen["TaskListener.onTask<br/>Group workflow-worker-tasks"]
-  store["ActivityIdempotencyStore.find<br/>Key workflowId, stepName, attempt"]
-  hit["Publish the stored ActivityCompletion<br/>Activity.execute is not called"]
-  invoke["WorkerActivityInvoker.invoke<br/>Lookup miss: UNKNOWN_ACTIVITY<br/>Thrown exception: ACTIVITY_EXCEPTION<br/>Stub success or STUB_FORCED_FAILURE"]
-  record["ActivityIdempotencyStore.record<br/>Commit the completion row, then publish"]
-  results["activity.results"]
-  result["ActivityResultListener.onResult<br/>WorkflowExecutor.onActivityResult"]
-  apply["applyResult<br/>Step must still be RUNNING<br/>Instance RUNNING or COMPENSATING<br/>Attempt must match<br/>Otherwise skip the write"]
-  fail["failStep<br/>Step FAILED, completed_at = now()<br/>error copied onto the instance<br/>output_json stays null"]
-  plan{"Instance was RUNNING<br/>and an earlier step is COMPLETED<br/>with a compensator?"}
-  comp["planCompensation<br/>Insert COMPENSATE_* rows<br/>Reverse position order, status PENDING, attempt 0<br/>Instance COMPENSATING<br/>Then run again"]
-  terminalFail["Instance FAILED<br/>Walk stops<br/>Later steps stay PENDING"]
-  compFail["Already COMPENSATING<br/>Instance FAILED<br/>Remaining compensation rows stay PENDING"]
-  mid["completeMidStep<br/>Step COMPLETED, output stored<br/>OPTIMISTIC_FORCE_INCREMENT bumps version<br/>If this step is a compensator,<br/>markForwardCompensated sets the forward step COMPENSATED<br/>Then run again"]
-  lastFwd["completeLastStep<br/>Last forward step and instance COMPLETED<br/>in one transaction<br/>Instance output_json copies the last output<br/>Walk stops. Happy path version is 10"]
-  lastComp["completeCompensation<br/>Compensation step COMPLETED<br/>Matching forward step COMPENSATED<br/>Instance COMPENSATED<br/>output_json stays null<br/>error stays the original forward failure<br/>Walk stops"]
+  task["Topic activity.tasks<br/>Value is ActivityContext"]
+  listen["TaskListener.onTask<br/>worker/src/main/java/com/workflowengine/worker/TaskListener.java<br/>Group workflow-worker-tasks"]
+  store["ActivityIdempotencyStore.find<br/>worker/src/main/java/com/workflowengine/worker/idempotency/ActivityIdempotencyStore.java<br/>Key workflowId, stepName, attempt<br/>Table activity_completion"]
+  hit["TaskListener.onTask<br/>worker/src/main/java/com/workflowengine/worker/TaskListener.java<br/>Publish the stored ActivityCompletion<br/>Activity.execute is not called"]
+  invoke["WorkerActivityInvoker.invoke<br/>worker/src/main/java/com/workflowengine/worker/WorkerActivityInvoker.java<br/>Activity beans in com.workflowengine.worker.activity<br/>Lookup miss: UNKNOWN_ACTIVITY<br/>Thrown exception: ACTIVITY_EXCEPTION<br/>Stub success or STUB_FORCED_FAILURE"]
+  record["ActivityIdempotencyStore.record<br/>worker/src/main/java/com/workflowengine/worker/idempotency/ActivityIdempotencyStore.java<br/>Commit the completion row<br/>TaskListener then publishes it"]
+  results["Topic activity.results<br/>Value is ActivityCompletion"]
+  result["ActivityResultListener.onResult<br/>runtime/ActivityResultListener.java<br/>Group workflow-engine-results<br/>Calls WorkflowExecutor.onActivityResult"]
+  apply["WorkflowExecutor.applyResult<br/>runtime/WorkflowExecutor.java<br/>Step must still be RUNNING<br/>Instance RUNNING or COMPENSATING<br/>Attempt must match<br/>Otherwise skip the write"]
+  fail["WorkflowExecutor.failStep<br/>runtime/WorkflowExecutor.java<br/>Step FAILED, completed_at = now()<br/>error copied onto the instance<br/>output_json stays null"]
+  plan{"WorkflowExecutor.failStep<br/>runtime/WorkflowExecutor.java<br/>Calls planCompensation when the instance was RUNNING"}
+  comp["WorkflowExecutor.planCompensation<br/>runtime/WorkflowExecutor.java<br/>Insert COMPENSATE_* rows<br/>Reverse position order, status PENDING, attempt 0<br/>Instance COMPENSATING<br/>onActivityResult calls WorkflowExecutor.run"]
+  terminalFail["WorkflowExecutor.failStep<br/>runtime/WorkflowExecutor.java<br/>Instance FAILED<br/>Walk stops<br/>Later steps stay PENDING"]
+  compFail["WorkflowExecutor.failStep<br/>runtime/WorkflowExecutor.java<br/>Instance was already COMPENSATING<br/>Instance FAILED<br/>Remaining compensation rows stay PENDING"]
+  mid["WorkflowExecutor.completeMidStep<br/>runtime/WorkflowExecutor.java<br/>Step COMPLETED, output stored<br/>OPTIMISTIC_FORCE_INCREMENT bumps version<br/>markForwardCompensated when this step is a compensator<br/>onActivityResult calls WorkflowExecutor.run"]
+  lastFwd["WorkflowExecutor.completeLastStep<br/>runtime/WorkflowExecutor.java<br/>Last forward step and instance COMPLETED<br/>in one transaction<br/>Instance output_json copies the last output<br/>Walk stops. Happy path version is 10"]
+  lastComp["WorkflowExecutor.completeCompensation<br/>runtime/WorkflowExecutor.java<br/>Compensation step COMPLETED<br/>markForwardCompensated sets the forward step COMPENSATED<br/>Instance COMPENSATED<br/>output_json stays null<br/>error stays the original forward failure<br/>Walk stops"]
 
   task --> listen --> store
   store -->|"row exists"| hit --> results
@@ -112,40 +112,65 @@ These classes do not run on the POST thread. They call the same executor after t
 
 ```mermaid
 flowchart TD
-  ready["ApplicationReadyEvent<br/>and every 2 seconds<br/>Scheduler thread schedule-"]
-  scan["RecoveryScanner.scan<br/>Statuses PENDING, RUNNING, COMPENSATING"]
-  pending["PENDING and every step PENDING<br/>WorkflowDispatcher.submit"]
-  gap["RUNNING or COMPENSATING<br/>no RUNNING step, a PENDING step remains<br/>WorkflowDispatcher.submit"]
-  republish["RUNNING step inside deadline_at<br/>and next_attempt_at due<br/>WorkflowDispatcher.submit<br/>Executor republishes the same attempt"]
-  skip["deadline_at already due<br/>Scanner does not submit"]
-  poll["TimeoutPoller.scan<br/>Statuses RUNNING and COMPENSATING<br/>Does not use WorkflowDispatcher"]
-  timeout["WorkflowExecutor.timeoutIfDue<br/>failStep error TIMED_OUT<br/>attempt unchanged<br/>If that write sets COMPENSATING, call run<br/>so the first compensation step starts"]
+  readyScan["RecoveryScanner.onReady<br/>RecoveryScanner.scheduled<br/>runtime/RecoveryScanner.java<br/>ApplicationReadyEvent, then every recovery interval<br/>Thread schedule- from WorkflowExecutionConfig"]
+  scan["RecoveryScanner.scan<br/>runtime/RecoveryScanner.java<br/>WorkflowInstanceRepository.findByStatusIn<br/>Statuses PENDING, RUNNING, COMPENSATING"]
+  pending["RecoveryScanner.due<br/>runtime/RecoveryScanner.java<br/>PENDING and every step PENDING<br/>WorkflowDispatcher.submit"]
+  gap["RecoveryScanner.due<br/>runtime/RecoveryScanner.java<br/>RUNNING or COMPENSATING<br/>no RUNNING step, a PENDING step remains<br/>WorkflowDispatcher.submit"]
+  republish["RecoveryScanner.due<br/>runtime/RecoveryScanner.java<br/>RUNNING step inside deadline_at and next_attempt_at due<br/>WorkflowDispatcher.submit<br/>WorkflowExecutor.republishIfDue keeps the attempt"]
+  skip["RecoveryScanner.due<br/>runtime/RecoveryScanner.java<br/>deadline_at already due<br/>Does not submit<br/>TimeoutPoller writes TIMED_OUT"]
+  readyPoll["TimeoutPoller.onReady<br/>TimeoutPoller.scheduled<br/>runtime/TimeoutPoller.java<br/>ApplicationReadyEvent, then every timeout interval<br/>Thread schedule- from WorkflowExecutionConfig"]
+  poll["TimeoutPoller.scan<br/>runtime/TimeoutPoller.java<br/>Statuses RUNNING and COMPENSATING<br/>Does not use WorkflowDispatcher"]
+  timeout["WorkflowExecutor.timeoutIfDue<br/>runtime/WorkflowExecutor.java<br/>applyTimeoutIfDue calls failStep<br/>error TIMED_OUT, attempt unchanged<br/>If that write sets COMPENSATING, call run<br/>so the first compensation step starts"]
 
-  ready --> scan
+  readyScan --> scan
   scan --> pending
   scan --> gap
   scan --> republish
   scan --> skip
-  ready --> poll --> timeout
+  readyPoll --> poll --> timeout
 ```
 
 `WorkflowDispatcher` keeps an in-memory inflight set so the scanner does not start a second `run` while this process is already inside one. After a crash the set is empty, and the next scan submits the leftover. `FAILED`, `COMPLETED`, and `COMPENSATED` are terminal. The scanner does not select them, and an idempotent `POST` does not submit them either.
 
-`GET` is separate from this loop. `GetWorkflowService.get` loads the instance and its steps in position order and returns that snapshot, including a leftover. `WorkflowController.get` maps a missing id to `404`.
+`GET` is separate from this loop.
+
+```mermaid
+flowchart TD
+  get["WorkflowController.get<br/>web/WorkflowController.java<br/>GET /api/v1/workflows/id"]
+  load["GetWorkflowService.get<br/>application/GetWorkflowService.java<br/>WorkflowInstanceRepository.findById<br/>Steps ordered by position<br/>Returns the committed snapshot, including a leftover"]
+  body["WorkflowResponses.from<br/>web/WorkflowResponses.java<br/>HTTP 200 WorkflowResponse"]
+  missing["RestExceptionHandler.notFound<br/>web/RestExceptionHandler.java<br/>WorkflowNotFoundException becomes 404"]
+
+  get --> load
+  load -->|row exists| body
+  load -->|no row| missing
+```
 
 ## Classes
 
-| Class | Thread | What it does on this path |
-|---|---|---|
-| `BodySizeFilter` | HTTP | Rejects an `/api/` body over 64 KB with 413. |
-| `WorkflowController` | HTTP | Admits on POST and loads a snapshot on GET. |
-| `StartWorkflowService` | HTTP | Validates, commits the admit transaction, submits only the insert winner. |
-| `WorkflowDefinitionRegistry` | any | Maps `ORDER` to `OrderWorkflowDefinition`. |
-| `RestExceptionHandler` | HTTP | Generic 400, 404, 413, 503, and 500 bodies. |
-| `WorkflowDispatcher` | HTTP or `schedule-` | One inflight `run` per id on `workflowTaskExecutor`. |
-| `WorkflowExecutor` | `workflow-*`, result listener, or `schedule-` | Commits step-start, republish, complete, fail, and compensation. |
-| `KafkaTaskPublisher` | `workflow-*` | Sends `ActivityContext` after the step-start commit. |
-| `ActivityResultListener` | Kafka listener | Delivers `ActivityCompletion` to `onActivityResult`. |
-| `RecoveryScanner` | `schedule-` | Submits a never-started admit or a due running step. |
-| `TimeoutPoller` | `schedule-` | Fails a due `RUNNING` step with `TIMED_OUT`. |
-| `GetWorkflowService` | HTTP | Returns the committed snapshot for GET. |
+Engine paths are under `engine/src/main/java/com/workflowengine/`. Worker and `engine-api` rows use their full path. Each diagram block starts with `Class.method` and names that file.
+
+| Class | Source | Thread | What it does on this path |
+|---|---|---|---|
+| `BodySizeFilter` | `web/BodySizeFilter.java` | HTTP | Rejects an `/api/` body over 64 KB with 413. |
+| `WorkflowController` | `web/WorkflowController.java` | HTTP | Admits on POST and loads a snapshot on GET. |
+| `WorkflowResponses` | `web/WorkflowResponses.java` | HTTP | Turns a snapshot into the JSON body. |
+| `RestExceptionHandler` | `web/RestExceptionHandler.java` | HTTP | Generic 400, 404, 413, 503, and 500 bodies. |
+| `StartWorkflowService` | `application/StartWorkflowService.java` | HTTP | Validates, commits the admit transaction, submits only the insert winner. |
+| `AdmissionResult` | `application/AdmissionResult.java` | HTTP | `created` true is the 201 path. `created` false is the 200 path. |
+| `GetWorkflowService` | `application/GetWorkflowService.java` | HTTP | Returns the committed snapshot for GET. |
+| `WorkflowDefinitionRegistry` | `domain/WorkflowDefinitionRegistry.java` | any | Maps `ORDER` to `OrderWorkflowDefinition`. |
+| `OrderWorkflowDefinition` | `definition/OrderWorkflowDefinition.java` | any | Five forward steps, each with a compensator and a 5-minute timeout. |
+| `WorkflowInstanceRepository` | `persistence/WorkflowInstanceRepository.java` | any | Loads and inserts the instance and its steps. |
+| `WorkflowExecutionConfig` | `config/WorkflowExecutionConfig.java` | startup | Builds the `workflow-` pool and the `schedule-` thread. |
+| `WorkflowDispatcher` | `runtime/WorkflowDispatcher.java` | HTTP or `schedule-` | One inflight `run` per id on `workflowTaskExecutor`. |
+| `WorkflowExecutor` | `runtime/WorkflowExecutor.java` | `workflow-*`, result listener, or `schedule-` | `choose`, `startStep`, `republishIfDue`, `applyResult`, `failStep`, `planCompensation`, `completeMidStep`, `completeLastStep`, `completeCompensation`, `timeoutIfDue`. |
+| `KafkaTaskPublisher` | `runtime/KafkaTaskPublisher.java` | `workflow-*` | Sends `ActivityContext` after the step-start commit. |
+| `ActivityResultListener` | `runtime/ActivityResultListener.java` | Kafka listener | Delivers `ActivityCompletion` to `onActivityResult`. |
+| `RecoveryScanner` | `runtime/RecoveryScanner.java` | `schedule-` | `scan` and `due` submit a never-started admit or a due running step. |
+| `TimeoutPoller` | `runtime/TimeoutPoller.java` | `schedule-` | `scan` asks `timeoutIfDue` to fail a due `RUNNING` step with `TIMED_OUT`. |
+| `TaskListener` | `worker/src/main/java/com/workflowengine/worker/TaskListener.java` | worker listener | Consumes a task, skips a stored attempt, publishes `ActivityCompletion`. |
+| `ActivityIdempotencyStore` | `worker/src/main/java/com/workflowengine/worker/idempotency/ActivityIdempotencyStore.java` | worker listener | `find` and `record` on `activity_completion`. |
+| `WorkerActivityInvoker` | `worker/src/main/java/com/workflowengine/worker/WorkerActivityInvoker.java` | worker listener | Looks up the `Activity` bean and calls `execute`. |
+| `ActivityContext` | `engine-api/src/main/java/com/workflowengine/api/activity/ActivityContext.java` | Kafka | Task record. JSON inside it stays text. |
+| `ActivityCompletion` | `engine-api/src/main/java/com/workflowengine/api/activity/ActivityCompletion.java` | Kafka | Result record. |

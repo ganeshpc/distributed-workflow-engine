@@ -82,7 +82,7 @@ public class RecoveryScanner {
         }
         Instant now = clock.instant();
         List<WorkflowInstanceEntity> leftovers = instances.findByStatusIn(
-                List.of(WorkflowStatus.PENDING, WorkflowStatus.RUNNING));
+                List.of(WorkflowStatus.PENDING, WorkflowStatus.RUNNING, WorkflowStatus.COMPENSATING));
         for (WorkflowInstanceEntity instance : leftovers) {
             if (due(instance, now)) {
                 log.info("recovery submit workflowId={} status={} version={}",
@@ -104,7 +104,8 @@ public class RecoveryScanner {
         if (instance.getStatus() == WorkflowStatus.PENDING) {
             return instance.getSteps().stream().allMatch(step -> step.getStatus() == StepStatus.PENDING);
         }
-        if (instance.getStatus() != WorkflowStatus.RUNNING) {
+        if (instance.getStatus() != WorkflowStatus.RUNNING
+                && instance.getStatus() != WorkflowStatus.COMPENSATING) {
             return false;
         }
         boolean anyRunning = instance.getSteps().stream()

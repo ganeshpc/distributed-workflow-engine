@@ -4,7 +4,7 @@ A Java 21 / Spring Boot 4.1 workflow **orchestrator**. It coordinates a linear e
 
 This is **not** Temporal. There is no event-sourced history, no deterministic replay of workflow code, and no task-queue matching. The engine stores *where the saga is now* (`PENDING` / `RUNNING` / `COMPLETED` / `FAILED`) and commits each transition before it calls the next activity.
 
-**Current stage: Phase 6.** The engine and one worker process, plus Postgres, a separate worker Postgres, and Kafka. The engine commits each step `RUNNING` and publishes a task. The worker runs the canned stub once per attempt, stores that result, and publishes it. A redelivery of the same attempt publishes the stored result and does not run the stub again. A lost task is republished at the same attempt. A step past `deadline_at` fails with error `TIMED_OUT`. `FAILED` is not retried. The stubs are still canned JSON.
+**Current stage: Phase 7.** The engine and one worker process, plus Postgres, a separate worker Postgres, and Kafka. The worker runs each canned stub once per attempt. A forward failure after completed steps walks those steps backward and ends `COMPENSATED`. A failure with nothing to undo stays `FAILED`. The stubs are still canned JSON.
 
 The design contract is [`docs/architecture.md`](docs/architecture.md). Agent rules are in [`AGENTS.md`](AGENTS.md).
 
@@ -620,6 +620,7 @@ Manual leftover checks (SQL plant + restart) are described in the Phase 2 PR dis
 | 4 | Skipped | The worker contract was already `Activity` in `engine-api` |
 | 5 | Done | Kafka plus one worker. Republish keeps the same attempt. |
 | 6 | Done | Worker stores a finished attempt and skips a second execute. |
-| 7+ | Planned | Compensation, optional worker split, multi-instance engine, signals, observability |
+| 7 | Done | Linear compensation after a forward failure. |
+| 8+ | Planned | Optional worker split, multi-instance engine, signals, observability |
 
 Do not run `replicas > 1` until out-of-process activities (5), idempotent activities (6), and claim/lock (9) exist.

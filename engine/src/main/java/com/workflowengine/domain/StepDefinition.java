@@ -16,8 +16,9 @@ import java.time.Duration;
  * @param name activity name the invoker looks up, for example {@code CREATE_ORDER}
  * @param retryPolicy attempt cap and backoff for {@code RUNNING} leftovers that are still inside the deadline
  * @param timeout per-attempt limit added to the engine clock at step-start and on each running-resume; null means no deadline; zero means due at the moment the attempt starts; negative is rejected
+ * @param compensationName activity that undoes this step after a later forward failure; null when this step has no compensator
  */
-public record StepDefinition(String name, RetryPolicy retryPolicy, Duration timeout) {
+public record StepDefinition(String name, RetryPolicy retryPolicy, Duration timeout, String compensationName) {
 
     /**
      * Rejects a negative timeout. A null timeout is allowed and means the step never becomes due for the poller.
@@ -39,16 +40,27 @@ public record StepDefinition(String name, RetryPolicy retryPolicy, Duration time
      * @param name activity name
      */
     public StepDefinition(String name) {
-        this(name, RetryPolicy.defaults(), null);
+        this(name, RetryPolicy.defaults(), null, null);
     }
 
     /**
-     * Step with an explicit retry policy and no timeout.
+     * Step with an explicit retry policy and no timeout or compensator.
      *
      * @param name activity name
      * @param retryPolicy attempt cap and backoff; not null
      */
     public StepDefinition(String name, RetryPolicy retryPolicy) {
-        this(name, retryPolicy, null);
+        this(name, retryPolicy, null, null);
+    }
+
+    /**
+     * Step with no compensator.
+     *
+     * @param name activity name
+     * @param retryPolicy attempt cap and backoff; not null
+     * @param timeout per-attempt limit; null means no deadline
+     */
+    public StepDefinition(String name, RetryPolicy retryPolicy, Duration timeout) {
+        this(name, retryPolicy, timeout, null);
     }
 }

@@ -89,7 +89,8 @@ public class TimeoutPoller {
             return;
         }
         Instant now = clock.instant();
-        List<WorkflowInstanceEntity> running = instances.findByStatusIn(List.of(WorkflowStatus.RUNNING));
+        List<WorkflowInstanceEntity> running = instances.findByStatusIn(
+                List.of(WorkflowStatus.RUNNING, WorkflowStatus.COMPENSATING));
         for (WorkflowInstanceEntity instance : running) {
             if (expired(instance, now)) {
                 log.info("timeout due workflowId={} type={} status={} version={}",

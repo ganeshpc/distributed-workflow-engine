@@ -38,7 +38,9 @@ public final class WorkflowAwait {
         while (System.nanoTime() < deadline) {
             latest = instances.findById(workflowId).orElseThrow();
             WorkflowStatus status = latest.getStatus();
-            if (status == WorkflowStatus.COMPLETED || status == WorkflowStatus.FAILED) {
+            if (status == WorkflowStatus.COMPLETED
+                    || status == WorkflowStatus.FAILED
+                    || status == WorkflowStatus.COMPENSATED) {
                 return latest;
             }
             try {

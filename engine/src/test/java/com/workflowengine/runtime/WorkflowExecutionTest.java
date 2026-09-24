@@ -158,7 +158,7 @@ class WorkflowExecutionTest {
     }
 
     @Test
-    void failAtProcessPaymentStopsAtVersion6() {
+    void failAtProcessPaymentCompensatesCompletedSteps() {
         AdmissionResult admission = startWorkflowService.start(command(
                 "fail-pay-" + UUID.randomUUID(),
                 "{\"customerId\":\"cust-9\",\"failAt\":\"PROCESS_PAYMENT\"}"
@@ -168,25 +168,28 @@ class WorkflowExecutionTest {
         WorkflowInstanceEntity done = WorkflowAwait.awaitTerminal(
                 instances, admission.snapshot().id(), TERMINAL_TIMEOUT);
 
-        assertThat(done.getStatus()).isEqualTo(WorkflowStatus.FAILED);
-        assertThat(done.getCurrentStep()).isEqualTo("PROCESS_PAYMENT");
-        assertThat(done.getVersion()).isEqualTo(6);
+        assertThat(done.getStatus()).isEqualTo(WorkflowStatus.COMPENSATED);
+        assertThat(done.getCurrentStep()).isEqualTo("COMPENSATE_CREATE_ORDER");
+        assertThat(done.getVersion()).isEqualTo(10);
         assertThat(done.getOutputJson()).isNull();
         assertThat(done.getError()).isEqualTo("STUB_FORCED_FAILURE");
 
         List<WorkflowStepEntity> steps = done.getSteps();
-        assertThat(steps.get(0).getStatus()).isEqualTo(StepStatus.COMPLETED);
-        assertThat(steps.get(1).getStatus()).isEqualTo(StepStatus.COMPLETED);
+        assertThat(steps.get(0).getName()).isEqualTo("CREATE_ORDER");
+        assertThat(steps.get(0).getStatus()).isEqualTo(StepStatus.COMPENSATED);
+        assertThat(steps.get(1).getName()).isEqualTo("RESERVE_INVENTORY");
+        assertThat(steps.get(1).getStatus()).isEqualTo(StepStatus.COMPENSATED);
         assertThat(steps.get(2).getName()).isEqualTo("PROCESS_PAYMENT");
         assertThat(steps.get(2).getStatus()).isEqualTo(StepStatus.FAILED);
-        assertThat(steps.get(2).getCompletedAt()).isNotNull();
         assertThat(steps.get(2).getError()).isEqualTo("STUB_FORCED_FAILURE");
-        assertThat(steps.get(3).getName()).isEqualTo("CREATE_SHIPMENT");
         assertThat(steps.get(3).getStatus()).isEqualTo(StepStatus.PENDING);
-        assertThat(steps.get(3).getStartedAt()).isNull();
-        assertThat(steps.get(4).getName()).isEqualTo("SEND_NOTIFICATION");
         assertThat(steps.get(4).getStatus()).isEqualTo(StepStatus.PENDING);
-        assertThat(steps.get(4).getStartedAt()).isNull();
+        assertThat(steps.get(5).getName()).isEqualTo("COMPENSATE_RESERVE_INVENTORY");
+        assertThat(steps.get(5).getStatus()).isEqualTo(StepStatus.COMPLETED);
+        assertThat(steps.get(5).getAttempt()).isEqualTo(1);
+        assertThat(steps.get(6).getName()).isEqualTo("COMPENSATE_CREATE_ORDER");
+        assertThat(steps.get(6).getStatus()).isEqualTo(StepStatus.COMPLETED);
+        assertThat(steps.get(6).getAttempt()).isEqualTo(1);
     }
 
     @Test

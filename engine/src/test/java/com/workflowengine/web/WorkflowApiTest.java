@@ -255,24 +255,21 @@ class WorkflowApiTest {
         UUID id = UUID.fromString(read(created).path("id").asString());
 
         JsonNode done = pollUntilTerminal(id);
-        assertThat(done.path("status").asString()).isEqualTo("FAILED");
-        assertThat(done.path("currentStep").asString()).isEqualTo("PROCESS_PAYMENT");
-        assertThat(done.path("version").asInt()).isEqualTo(6);
+        assertThat(done.path("status").asString()).isEqualTo("COMPENSATED");
+        assertThat(done.path("currentStep").asString()).isEqualTo("COMPENSATE_CREATE_ORDER");
+        assertThat(done.path("version").asInt()).isEqualTo(10);
         assertThat(done.path("output").isNull()).isTrue();
         assertThat(done.path("error").asString()).isEqualTo("STUB_FORCED_FAILURE");
 
         JsonNode steps = done.path("steps");
-        assertThat(steps.get(0).path("status").asString()).isEqualTo("COMPLETED");
-        assertThat(steps.get(1).path("status").asString()).isEqualTo("COMPLETED");
+        assertThat(steps.get(0).path("status").asString()).isEqualTo("COMPENSATED");
+        assertThat(steps.get(1).path("status").asString()).isEqualTo("COMPENSATED");
         assertThat(steps.get(2).path("name").asString()).isEqualTo("PROCESS_PAYMENT");
         assertThat(steps.get(2).path("status").asString()).isEqualTo("FAILED");
-        assertThat(steps.get(2).path("completedAt").isNull()).isFalse();
-        assertThat(steps.get(3).path("name").asString()).isEqualTo("CREATE_SHIPMENT");
-        assertThat(steps.get(3).path("status").asString()).isEqualTo("PENDING");
-        assertThat(steps.get(3).path("startedAt").isNull()).isTrue();
-        assertThat(steps.get(4).path("name").asString()).isEqualTo("SEND_NOTIFICATION");
-        assertThat(steps.get(4).path("status").asString()).isEqualTo("PENDING");
-        assertThat(steps.get(4).path("startedAt").isNull()).isTrue();
+        assertThat(steps.get(5).path("name").asString()).isEqualTo("COMPENSATE_RESERVE_INVENTORY");
+        assertThat(steps.get(5).path("status").asString()).isEqualTo("COMPLETED");
+        assertThat(steps.get(6).path("name").asString()).isEqualTo("COMPENSATE_CREATE_ORDER");
+        assertThat(steps.get(6).path("status").asString()).isEqualTo("COMPLETED");
     }
 
     @Test
@@ -349,7 +346,7 @@ class WorkflowApiTest {
                     .andReturn();
             latest = read(result);
             String status = latest.path("status").asString();
-            if ("COMPLETED".equals(status) || "FAILED".equals(status)) {
+            if ("COMPLETED".equals(status) || "FAILED".equals(status) || "COMPENSATED".equals(status)) {
                 return latest;
             }
             Thread.sleep(25);

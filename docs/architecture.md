@@ -4,7 +4,7 @@
 |---|---|
 | **Author** | Engineering |
 | **Date** | 2026-09-13 |
-| **Status** | Draft. Phases 1–3, 5, and 6 are implemented. Phase 4 was skipped. Later phases stay Planned. Where an early section still says Phase 1 is the next slice, [Incremental Roadmap](#incremental-roadmap) is the status to follow. |
+| **Status** | Draft. Phases 1–3 and 5–7 are implemented. Phase 4 was skipped. Later phases stay Planned. Where an early section still says Phase 1 is the next slice, [Incremental Roadmap](#incremental-roadmap) is the status to follow. |
 | **Type** | Architecture + incremental implementation plan |
 | **Code in this revision** | The original review draft contained no code. The repository now contains Phases 1–3, 5, and 6. |
 
@@ -1126,11 +1126,20 @@ The worker database (not the engine database) stores one row per finished attemp
 
 Concepts: effectively-once for a finished attempt = at-least-once delivery + idempotent handler.
 
-### Phase 7 — Compensation / saga rollback (**Planned**)
+### Phase 7 — Compensation / saga rollback (**implemented**, PR-10)
 
-- Linear reverse list for completed forward steps. **Not** a general BPMN engine.
-- New states: `COMPENSATING`, `COMPENSATED`.
-- Depends on Phase 6.
+A forward step that fails after earlier steps completed does not leave the instance `FAILED`. The failure transaction sets the instance to `COMPENSATING` and inserts one `PENDING` row per completed forward step that has a compensator, in reverse `position` order. The failed step itself is not compensated. A failure of the first step, with nothing completed, stays `FAILED`.
+
+- Compensation rows are new steps (`COMPENSATE_CREATE_ORDER`, and so on). They use the normal `PENDING` / `RUNNING` / `COMPLETED` walk and a distinct idempotency key from the forward attempt.
+- When a compensation activity succeeds, the forward step it undoes becomes `COMPENSATED`. Its forward `output_json` stays.
+- The last compensation success and instance `COMPENSATED` commit together. Instance `output_json` stays null. `error` stays the forward failure.
+- A compensation failure or timeout sets the instance `FAILED`. Remaining compensation rows stay `PENDING`.
+- `COMPENSATING` is resumed by the recovery scanner and watched by the timeout poller. `COMPENSATED` and `FAILED` are terminal.
+- Stubs still return canned JSON. This is not a graph engine.
+
+### Phase 7 statuses
+
+`COMPENSATING` and `COMPENSATED` are instance statuses. `COMPENSATED` is also a forward-step status. Compensation activity rows do not use those values.
 
 ### Phase 8 — Split workers (**Planned**, optional)
 
@@ -1480,7 +1489,7 @@ Do not open a PR that scaffolds unused worker services, Kafka, or a designer.
 - **Depends on:** PR-08
 - **Description:** Effectively-once side effects. **Hard dependency** of any later PR that runs activities with real side effects (compensation against money/stock, multi-instance engines that can double-dispatch, split workers talking to real systems).
 
-### PR-10 — Compensation (**Phase 7**)
+### PR-10 — Compensation (**Phase 7**, **implemented**)
 
 - **Title:** Linear saga compensation for ORDER
 - **Files/components:** compensate step list; `COMPENSATING` / `COMPENSATED`; tests for payment failure after reserve

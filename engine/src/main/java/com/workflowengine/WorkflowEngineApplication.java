@@ -13,11 +13,11 @@ import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
  * classpath contains the worker jar. Listens on port 8080. Actuator exposes
  * {@code health} only.
  *
- * <p>Entity and repository scans stay on {@code com.workflowengine.persistence}.
- * The worker jar is on the engine test classpath and owns
- * {@code activity_completion} in a different database. Scanning
- * {@code com.workflowengine.worker} would map that table onto the engine
- * datasource.
+ * <p>Entity and repository scans stay on {@code com.workflowengine.persistence}
+ * and {@code com.workflowengine.history}. The worker jar is on the engine
+ * test classpath and owns {@code activity_completion} in a different database.
+ * Scanning {@code com.workflowengine.worker} would map that table onto the
+ * engine datasource.
  *
  * <p>This class is a process singleton created by Spring. Failure to start
  * (missing Postgres, Kafka, or Flyway) is a JVM exit, not an HTTP mapping.
@@ -27,12 +27,13 @@ import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
         "com.workflowengine.config",
         "com.workflowengine.definition",
         "com.workflowengine.domain",
+        "com.workflowengine.history",
         "com.workflowengine.persistence",
         "com.workflowengine.runtime",
         "com.workflowengine.web"
 })
-@EntityScan("com.workflowengine.persistence")
-@EnableJpaRepositories("com.workflowengine.persistence")
+@EntityScan({"com.workflowengine.persistence", "com.workflowengine.history"})
+@EnableJpaRepositories({"com.workflowengine.persistence", "com.workflowengine.history"})
 public class WorkflowEngineApplication {
 
     /**

@@ -30,7 +30,7 @@ Honesty labels used in `docs/architecture.md`:
 - **Planned** — later increment. Do not start unless the user asked for that phase.
 - **Theoretical** — discussed, and not part of the Temporal-clone destination unless a later revision promotes it.
 
-Current code is Phase 7 (PR-10): the engine commits `RUNNING`, publishes `activity.tasks`, and applies `activity.results`. One `worker` module runs the forward stubs and their compensation stubs, and stores a finished attempt in its own database. A redelivery of the same `(workflowId, step, attempt)` publishes the stored result and does not execute again. A forward failure after completed steps walks those steps backward and ends `COMPENSATED`. A failure with nothing to undo stays `FAILED`. `FAILED` and `COMPENSATED` are not retried. The clone path starts at Phase 13 (history log) when that phase is requested. Phases 8 and 9 are optional current-state work and are not that path. Phases 10 and 12 are withdrawn. Do not scaffold signals, timer steps, a second worker, a history table, or a designer until the phase that owns them.
+Current code is Phase 13: the engine commits `RUNNING`, publishes `activity.tasks`, and applies `activity.results`, and each committed transition appends `workflow_event` in that same transaction. One `worker` module runs the forward stubs and their compensation stubs, and stores a finished attempt in its own database. A redelivery of the same `(workflowId, step, attempt)` publishes the stored result and does not execute again. A forward failure after completed steps walks those steps backward and ends `COMPENSATED`. A failure with nothing to undo stays `FAILED`. `FAILED` and `COMPENSATED` are not retried. `RecoveryScanner` reads the history, then the projection. The next clone phase is Phase 14 (workflow tasks) when that phase is requested. Phases 8 and 9 are optional current-state work and are not that path. Phases 10 and 12 are withdrawn. Do not scaffold signals, timer steps, a second worker, workflow-task replay, or a designer until the phase that owns them.
 
 ---
 
@@ -205,7 +205,7 @@ Error bodies are generic (`Bad Request`, `Not Found`, `Payload Too Large`, `Serv
 - Flyway SQL under `engine/src/main/resources/db/migration/`. `spring.jpa.hibernate.ddl-auto=none`.
 - JSON payloads are `JSONB`. Timestamps are `TIMESTAMPTZ`, assigned by PostgreSQL. Map with Hibernate `@Generated` / `insertable=false, updatable=false`. Tests must not assert equality with `Instant.now()` from the JVM.
 - Step order is `workflow_step.position`. Names are not an order. Do not `ORDER BY started_at`.
-- Do not add `workflow_event` before Phase 13. That phase is the first reader.
+- `workflow_event` is append-only and is written only in the transition transaction that updates the projection. Do not update or delete those rows.
 - Do not add `CANCELED` / `TIMED_OUT` / `COMPENSATING` status values or check constraints until a phase branches on that status. Phase 3 records timeouts as `FAILED` with error `TIMED_OUT` and column `deadline_at`.
 - Schema PRs after Phase 1 are expand/contract if rows exist that matter.
 

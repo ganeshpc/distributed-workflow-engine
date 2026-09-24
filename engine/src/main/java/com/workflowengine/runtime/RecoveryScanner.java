@@ -2,6 +2,8 @@ package com.workflowengine.runtime;
 
 import com.workflowengine.api.StepStatus;
 import com.workflowengine.api.WorkflowStatus;
+import com.workflowengine.history.WorkflowEventEntity;
+import com.workflowengine.history.WorkflowHistory;
 import com.workflowengine.persistence.WorkflowInstanceEntity;
 import com.workflowengine.persistence.WorkflowInstanceRepository;
 import com.workflowengine.persistence.WorkflowStepEntity;
@@ -38,23 +40,27 @@ import java.util.List;
 public class RecoveryScanner {
 
     private final WorkflowInstanceRepository instances;
+    private final WorkflowHistory history;
     private final WorkflowDispatcher dispatcher;
     private final Clock clock;
     private final boolean enabled;
 
     /**
      * @param instances leftover query
+     * @param history execution log read before the projection is used
      * @param dispatcher submit-once per inflight id
      * @param clock backoff due-time
      * @param enabled when false, scans are no-ops (tests that plant leftovers)
      */
     public RecoveryScanner(
             WorkflowInstanceRepository instances,
+            WorkflowHistory history,
             WorkflowDispatcher dispatcher,
             Clock clock,
             @Value("${workflow.recovery.enabled:true}") boolean enabled
     ) {
         this.instances = instances;
+        this.history = history;
         this.dispatcher = dispatcher;
         this.clock = clock;
         this.enabled = enabled;
@@ -84,6 +90,11 @@ public class RecoveryScanner {
         List<WorkflowInstanceEntity> leftovers = instances.findByStatusIn(
                 List.of(WorkflowStatus.PENDING, WorkflowStatus.RUNNING, WorkflowStatus.COMPENSATING));
         for (WorkflowInstanceEntity instance : leftovers) {
+            List<WorkflowEventEntity> recorded = history.read(instance.getId());
+            if (recorded.isEmpty()) {
+                log.warn("recovery history empty workflowId={} status={} version={}",
+                        instance.getId(), instance.getStatus(), instance.getVersion());
+            }
             if (due(instance, now)) {
                 log.info("recovery submit workflowId={} status={} version={}",
                         instance.getId(), instance.getStatus(), instance.getVersion());

@@ -8,6 +8,8 @@ import com.workflowengine.api.activity.ActivityResult;
 import com.workflowengine.domain.StepDefinition;
 import com.workflowengine.domain.WorkflowDefinition;
 import com.workflowengine.domain.WorkflowDefinitionRegistry;
+import com.workflowengine.history.HistoryEventType;
+import com.workflowengine.history.WorkflowHistory;
 import com.workflowengine.persistence.WorkflowInstanceEntity;
 import com.workflowengine.persistence.WorkflowInstanceRepository;
 import com.workflowengine.persistence.WorkflowStepEntity;
@@ -72,6 +74,7 @@ public class WorkflowExecutor {
     private final TaskPublisher publisher;
     private final TransactionTemplate tx;
     private final EntityManager entityManager;
+    private final WorkflowHistory history;
     private final Clock clock;
     private final Duration republishAfter;
 
@@ -89,6 +92,7 @@ public class WorkflowExecutor {
      * @param publisher task sender used only after the step-start transaction commits
      * @param transactionManager not used as a class-level {@code @Transactional}
      * @param entityManager used to force {@code @Version} bumps and stamp timestamps
+     * @param history appends one event per committed transition in the same transaction
      * @param clock republish due-time and step-deadline clock
      * @param republishAfterMs delay stored in {@code next_attempt_at} at step-start;
      * zero means the scanner may republish immediately
@@ -99,6 +103,7 @@ public class WorkflowExecutor {
             TaskPublisher publisher,
             PlatformTransactionManager transactionManager,
             EntityManager entityManager,
+            WorkflowHistory history,
             Clock clock,
             @Value("${workflow.dispatch.republish-after-ms:30000}") long republishAfterMs
     ) {
@@ -107,6 +112,7 @@ public class WorkflowExecutor {
         this.publisher = publisher;
         this.tx = new TransactionTemplate(transactionManager);
         this.entityManager = entityManager;
+        this.history = history;
         this.clock = clock;
         this.republishAfter = Duration.ofMillis(Math.max(republishAfterMs, 0));
         this.timeoutStripes = new Object[TIMEOUT_STRIPES];
@@ -355,6 +361,7 @@ public class WorkflowExecutor {
         }
         instance.setCurrentStep(stepName);
         stampStartedAt(step);
+        history.append(instance, HistoryEventType.STEP_STARTED, step, null);
 
         log.info("step started workflowId={} type={} step={} attempt={} status={} version={}",
                 instance.getId(), instance.getType(), stepName, attempt, instance.getStatus(), instance.getVersion());
@@ -423,7 +430,8 @@ public class WorkflowExecutor {
         step.setStatus(StepStatus.COMPLETED);
         step.setOutputJson(result.outputJson());
         step.setError(null);
-        markForwardCompensated(instance, step.getName());
+        history.append(instance, HistoryEventType.STEP_COMPLETED, step, null);
+        appendForwardCompensated(instance, step.getName());
         entityManager.lock(instance, LockModeType.OPTIMISTIC_FORCE_INCREMENT);
         stampCompletedAt(step);
 
@@ -455,6 +463,8 @@ public class WorkflowExecutor {
         instance.setOutputJson(result.outputJson());
         instance.setError(null);
         stampCompletedAt(step);
+        history.append(instance, HistoryEventType.STEP_COMPLETED, step, null);
+        history.append(instance, HistoryEventType.WORKFLOW_COMPLETED, null);
 
         log.info("workflow completed workflowId={} type={} step={} attempt={} status=COMPLETED version={}",
                 workflowId, instance.getType(), step.getName(), step.getAttempt(), instance.getVersion());
@@ -486,6 +496,9 @@ public class WorkflowExecutor {
         instance.setCurrentStep(step.getName());
         instance.setOutputJson(null);
         stampCompletedAt(step);
+        history.append(instance, HistoryEventType.STEP_COMPLETED, step, null);
+        appendForwardCompensated(instance, step.getName());
+        history.append(instance, HistoryEventType.WORKFLOW_COMPENSATED, null);
 
         log.info("workflow compensated workflowId={} type={} step={} attempt={} status=COMPENSATED version={}",
                 workflowId, instance.getType(), step.getName(), step.getAttempt(), instance.getVersion());
@@ -517,11 +530,13 @@ public class WorkflowExecutor {
             step.setOutputJson(result.outputJson());
         }
         stampCompletedAt(step);
+        history.append(instance, HistoryEventType.STEP_FAILED, step, null);
         if (instance.getStatus() == WorkflowStatus.RUNNING && planCompensation(instance, step)) {
             instance.setStatus(WorkflowStatus.COMPENSATING);
             instance.setCurrentStep(step.getName());
             instance.setError(result.error());
             instance.setOutputJson(null);
+            history.append(instance, HistoryEventType.WORKFLOW_COMPENSATING, null);
             log.info("workflow compensating workflowId={} type={} step={} attempt={} status=COMPENSATING version={}",
                     workflowId, instance.getType(), step.getName(), step.getAttempt(), instance.getVersion());
             return true;
@@ -530,6 +545,7 @@ public class WorkflowExecutor {
         instance.setCurrentStep(step.getName());
         instance.setError(result.error());
         instance.setOutputJson(null);
+        history.append(instance, HistoryEventType.WORKFLOW_FAILED, null);
 
         log.info("workflow failed workflowId={} type={} step={} attempt={} status=FAILED version={}",
                 workflowId, instance.getType(), step.getName(), step.getAttempt(), instance.getVersion());
@@ -665,8 +681,22 @@ public class WorkflowExecutor {
             instance.addStep(compensation);
             entityManager.persist(compensation);
             planned = true;
+            history.append(instance, HistoryEventType.COMPENSATION_PLANNED, compensation, null);
         }
         return planned;
+    }
+
+    /**
+     * Records {@code FORWARD_COMPENSATED} when {@code compensationName} undoes a forward step.
+     *
+     * @param instance aggregate in this transaction
+     * @param compensationName activity that just succeeded
+     */
+    private void appendForwardCompensated(WorkflowInstanceEntity instance, String compensationName) {
+        WorkflowStepEntity forward = markForwardCompensated(instance, compensationName);
+        if (forward != null) {
+            history.append(instance, HistoryEventType.FORWARD_COMPENSATED, forward, null);
+        }
     }
 
     /**
@@ -674,11 +704,12 @@ public class WorkflowExecutor {
      *
      * @param instance aggregate in this transaction
      * @param compensationName activity that just succeeded
+     * @return the forward step that changed, or null when this activity is not a compensator
      */
-    private void markForwardCompensated(WorkflowInstanceEntity instance, String compensationName) {
+    private WorkflowStepEntity markForwardCompensated(WorkflowInstanceEntity instance, String compensationName) {
         WorkflowDefinition definition = definitions.findByType(instance.getType()).orElse(null);
         if (definition == null || !isCompensation(definition, compensationName)) {
-            return;
+            return null;
         }
         String forwardName = definition.steps().stream()
                 .filter(step -> compensationName.equals(step.compensationName()))
@@ -686,12 +717,16 @@ public class WorkflowExecutor {
                 .findFirst()
                 .orElse(null);
         if (forwardName == null) {
-            return;
+            return null;
         }
-        instance.getSteps().stream()
+        return instance.getSteps().stream()
                 .filter(step -> forwardName.equals(step.getName()))
                 .findFirst()
-                .ifPresent(step -> step.setStatus(StepStatus.COMPENSATED));
+                .map(step -> {
+                    step.setStatus(StepStatus.COMPENSATED);
+                    return step;
+                })
+                .orElse(null);
     }
 
     private static boolean isCompensation(WorkflowDefinition definition, String stepName) {

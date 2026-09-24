@@ -164,7 +164,8 @@ Engine paths are under `engine/src/main/java/com/workflowengine/`. Worker and `e
 | `WorkflowInstanceRepository` | `persistence/WorkflowInstanceRepository.java` | any | Loads and inserts the instance and its steps. |
 | `WorkflowExecutionConfig` | `config/WorkflowExecutionConfig.java` | startup | Builds the `workflow-` pool and the `schedule-` thread. |
 | `WorkflowDispatcher` | `runtime/WorkflowDispatcher.java` | HTTP or `schedule-` | One inflight `run` per id on `workflowTaskExecutor`. |
-| `WorkflowExecutor` | `runtime/WorkflowExecutor.java` | `workflow-*`, result listener, or `schedule-` | `choose`, `startStep`, `republishIfDue`, `applyResult`, `failStep`, `planCompensation`, `completeMidStep`, `completeLastStep`, `completeCompensation`, `timeoutIfDue`. |
+| `WorkflowExecutor` | `runtime/WorkflowExecutor.java` | `workflow-*`, result listener, or `schedule-` | `choose`, `startStep`, `republishIfDue`, `applyResult`, `failStep`, `planCompensation`, `completeMidStep`, `completeLastStep`, `completeCompensation`, `timeoutIfDue`. Each committed transition appends history in that transaction. |
+| `WorkflowHistory` | `history/WorkflowHistory.java` | the caller's transaction, or a read on `schedule-` | Appends `workflow_event` and reads it in `event_id` order. `RecoveryScanner` reads this log before it uses the projection. |
 | `KafkaTaskPublisher` | `runtime/KafkaTaskPublisher.java` | `workflow-*` | Sends `ActivityContext` after the step-start commit. |
 | `ActivityResultListener` | `runtime/ActivityResultListener.java` | Kafka listener | Delivers `ActivityCompletion` to `onActivityResult`. |
 | `RecoveryScanner` | `runtime/RecoveryScanner.java` | `schedule-` | `scan` and `due` submit a never-started admit or a due running step. |

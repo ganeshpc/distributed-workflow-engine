@@ -4,15 +4,15 @@
 |---|---|
 | **Author** | Engineering |
 | **Date** | 2026-09-13 |
-| **Status** | Draft. Phases 1–3 and 5–7 are implemented. Phase 4 was skipped. Later phases stay Planned. Where an early section still says Phase 1 is the next slice, [Incremental Roadmap](#incremental-roadmap) is the status to follow. |
+| **Status** | Draft. Phases 1–3 and 5–7 are implemented. Phase 4 was skipped. The product aim is a production-ready Temporal clone. The current code is the current-state core that clone is built on. Where an early section still says Phase 1 is the next slice, [Incremental Roadmap](#incremental-roadmap) is the status to follow. |
 | **Type** | Architecture + incremental implementation plan |
-| **Code in this revision** | The original review draft contained no code. The repository now contains Phases 1–3, 5, and 6. |
+| **Code in this revision** | Phases 1–3 and 5–7. History, deterministic replay, task-queue matching, and worker SDKs are the committed destination and are not in this revision. |
 
 Honesty labels used throughout:
 
 - **Phase 1** — the only implementation slice after this document is approved.
 - **Planned** — a later, separately scoped increment. Not implied by Phase 1.
-- **Theoretical** — discussed so we share vocabulary. Not committed.
+- **Theoretical** — discussed, and not part of the Temporal-clone destination unless a later revision promotes it.
 
 ---
 
@@ -20,7 +20,9 @@ Honesty labels used throughout:
 
 We will build a Java workflow engine that coordinates multi-step business processes across independent services. The first business example is a linear e-commerce order saga: create order, reserve inventory, process payment, create shipment, send notification. The engine owns orchestration state, scheduling, and recovery. Workers own business operations. Those two concerns must never collapse into an e-commerce monolith that happens to have a "workflow" package.
 
-This is **not** a Temporal clone. Temporal is a durable-execution system: event-sourced workflow history, deterministic replay of user workflow code, task-queue matching, durable timers, signals, and multi-language SDKs. Replicating that in v1 is a multi-year trap. We will build an **orchestrator with durable workflow state** — closer to Netflix Conductor, AWS Step Functions, or a classic saga orchestrator. Temporal-like replay remains **Theoretical** unless a later phase produces a concrete reason to pay for it.
+The product aim is a **production-ready Temporal clone**: event-sourced workflow history, deterministic replay of workflow code, task-queue matching, durable timers, signals, query handlers, and worker SDKs. This repository is that product. It is not a learning exercise and not a side project.
+
+Phases 1–7 shipped the current-state core that clone stands on. PostgreSQL stores where the saga is now, and each transition commits before the next activity. History and replay are later phases of the same system. They are not a different product, and this revision does not pretend they are already running.
 
 **Phase 1** is deliberately small: one Spring Boot process, PostgreSQL as the source of truth, a Java-coded linear `ORDER` definition, in-process stub activities, REST start/query, and Testcontainers tests. No Kafka. No worker services. No compensation. No replay. The hard problem in Phase 1 is a correct persisted state machine with **committed** transitions, not a distributed topology.
 
@@ -40,9 +42,9 @@ A workflow engine exists to make those gaps first-class:
 - a single query path for progress
 - a place to hang retries, timeouts, compensation, and (later) async dispatch
 
-### What Temporal actually is (and why we will not start there)
+### What the production Temporal clone is
 
-Temporal is not "a REST API that runs steps." The production system is approximately:
+Temporal is not "a REST API that runs steps." The production system this repository is building is approximately:
 
 1. **Event-sourced history.** Every workflow decision, activity completion, timer, and signal is an event in an append-only history. Current state is *derived* by replay, not stored as `status = RUNNING`.
 2. **Deterministic workflow replay.** Worker processes re-execute workflow *code* from the beginning on every wake-up. Non-determinism (time, random, unrecorded I/O) is a product bug. This forces a specialized SDK, versioning rules, and "patch" APIs.
@@ -50,13 +52,13 @@ Temporal is not "a REST API that runs steps." The production system is approxima
 4. **Durable timers, signals, queries, updates.** These are history events, not `Thread.sleep` and not a REST afterthought.
 5. **A multi-service control plane.** Frontend, history, matching, worker SDK — years of work by a dedicated team.
 
-Cloning that before we have a working persisted state machine means we will spend the first quarter on an interpreter, a history store, and a determinism story, and still will not be able to start an order and query it after restart.
+The implemented phases built the persisted state machine first, so a history service and a replay loop have a correct saga underneath them. The destination is that full system, production-ready.
 
 We are honest about prior art:
 
 | System | What it really is | Relation to us |
 |---|---|---|
-| Temporal / Cadence | Durable execution via history + deterministic replay + worker poll | **Theoretical** evolution, not v1 |
+| Temporal / Cadence | Durable execution via history + deterministic replay + worker poll | **Product destination.** Phases 1–7 are the current-state core, not the finished clone. |
 | AWS Step Functions | Managed state machine, JSON (ASL) definitions, external activities | Close to our *target* shape |
 | Netflix Conductor | Server-owned state, JSON definitions, HTTP-polling workers | Close to early **Planned** phases |
 | Local saga / process manager | Orchestrator with current-state rows | **Phase 1** |
@@ -75,28 +77,30 @@ A tempting "serious" first commit is: five microservices, Kafka, gRPC, a saga li
 
 ### Goals
 
-- Teach and build a production-*shaped* engine incrementally: each phase is a running, tested system with an explicit consistency story.
+- Ship a production-ready Temporal clone in phases. Each phase is a running, tested system with an explicit consistency story.
 - **Phase 1:** persist a linear order workflow, return an id after admission, run five stub steps in-process, query status, survive process restart *as committed data*, prove transaction boundaries with Testcontainers.
 - Keep activity *implementations* movable. Do not pretend the Phase 1 synchronous invoker is the Phase 5 dispatch path.
 - Keep business rules out of the engine. Stubs return canned JSON. They do not check stock or talk to a card network.
 - Make PostgreSQL the system of record for orchestration metadata. Kafka, when it appears, is transport.
-- Label every capability **Phase 1**, **Planned**, or **Theoretical** so the repo never pretends to be Temporal.
+- Label every capability **implemented**, **Planned**, or **destination** so Phase 7 is not described as the finished clone.
 
-### Non-goals (Phase 1 and, unless promoted, later)
+### Destination (committed; not in the current code)
 
-- Temporal-compatible SDKs, histories, or replay (**Theoretical**).
-- Deterministic workflow-as-code with sandboxing (**Theoretical**).
-- Kafka, gRPC, or any worker protocol (**Planned**, not Phase 1).
-- Separate order / inventory / payment / shipping / notification services (**Planned**, and even then we start with *one* worker process).
-- Compensation / saga rollback (**Planned**, Phase 7).
-- Branching, parallel gates, child workflows, continue-as-new (**Planned** / **Theoretical**).
-- Signals and timer *steps* (**Planned**, Phase 10). Timeout *poller* is a different, earlier thing (**Planned**, Phase 3).
-- Query handlers / Temporal-style query methods (**Theoretical** — they belong to replay. `GET` of stored state is not a query handler).
-- Visual workflow designer, BPMN, custom DSL parser (**refused** for the foreseeable roadmap).
-- Multi-tenant namespaces, service mesh, Kubernetes operators (**refused** early; **Theoretical** later).
-- XA / two-phase commit across business resources (**refused** permanently).
-- Production SLA, horizontal scale, or "tens of workflows per second" in Phase 1.
-- Shipping a product a real company should run next quarter — that company should buy Temporal. See alternatives.
+- Event-sourced workflow history and deterministic replay of workflow code.
+- Task-queue matching and worker SDKs.
+- Durable timers, signals, and query handlers as history events.
+- Deterministic workflow-as-code, including the sandbox that replay requires.
+
+### Non-goals of the current-state phases
+
+- Treating Phase 7 as a finished Temporal replacement. History and replay land in their own phases.
+- Kafka, gRPC, or any worker protocol inside Phase 1. Kafka dispatch is implemented in Phase 5. gRPC stays Phase 12.
+- Separate order / inventory / payment / shipping / notification services until a real ownership boundary exists (Phase 8). One worker process is what Phase 5 shipped.
+- Adding query handlers, child workflows, or continue-as-new inside the current-state executor. They belong to the history and replay phases. `GET` of stored state is not a query handler.
+- Visual workflow designer, BPMN, and a custom DSL parser. The clone is workflow-as-code, as Temporal is.
+- Multi-tenant namespaces, a service mesh, and Kubernetes operators before the durable-execution core is production-ready.
+- XA / two-phase commit across business resources. Refused permanently. The saga model stays.
+- A production SLA or horizontal scale in Phase 1. Production readiness is the destination, after history, replay, matching, and the scale phases.
 
 ---
 
@@ -106,7 +110,7 @@ These are decided. They are not open questions. Phase 1 implementation forks tha
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Product shape | Durable *current-state* orchestrator, not a replay engine | Replay requires determinism + history + SDK. We need a correct state machine first. Closest honest prior art: Conductor / Step Functions / saga orchestrator. |
+| Product shape | Current code is a durable current-state orchestrator. The product destination is a production-ready Temporal clone: history, deterministic replay, task matching, and worker SDKs. | The state machine shipped first so replay has a correct core. Replay is the committed end state. |
 | Phase 1 topology | One Spring Boot process + Postgres. No Kafka. No worker modules. | State-machine correctness is independent of transport. Kafka before a SoT is how you distribute bugs. |
 | Source of truth | PostgreSQL for workflow/step rows | Queryable, transactional, restart-safe. Kafka is not a workflow store. |
 | Workflow definition | Java code (`OrderWorkflowDefinition`), `version() = 1`, persisted as `definition_version` | Type-safe, no interpreter. The version that *ran* must be on the row so Phase 2 resume is defined. |
@@ -135,9 +139,9 @@ These are decided. They are not open questions. Phase 1 implementation forks tha
 | Repo shape | Monorepo | One team, one version, atomic `engine-api` changes. |
 | REST package | `com.workflowengine.web` | Do not call the controller package `com.workflowengine.api` — that name is the `engine-api` module. |
 | Canceled spelling | `CANCELED` (one L) | One enum spelling when the state is introduced (**Planned**). Not a Phase 1 value. |
-| Worker extraction order | `Activity` in Phase 1 → one out-of-process worker (**Planned** Phase 5) → split services only if it teaches a real boundary (Phase 8) | Five microservices on day 1 optimize for org-chart theatre. |
+| Worker extraction order | `Activity` in Phase 1 → one out-of-process worker (Phase 5) → split services only when a service owns its data (Phase 8) | Five microservices on day 1 optimize for org-chart theatre. |
 | Multi-instance engine | **Planned** Phase 9, and *only after* activities are out-of-process | Two engine processes running in-process payment stubs is a double-charge bug with extra YAML. |
-| If the real goal were production next quarter | Use Temporal (or Conductor) | Building this is an educational + production-*shaped* project. We will not pretend otherwise. |
+| Product aim | A production-ready Temporal clone | This repository is that product. Phase 7 is the current-state core, not the finished system. Do not describe the project as a learning exercise or a side project. |
 
 ---
 
@@ -153,7 +157,7 @@ Cost of the naive start: weeks of compose, topic naming, consumer-group debuggin
 
 ### 2. Kafka as the source of truth for workflow state
 
-**Refused.** Kafka is a durable *log for transport*. Rebuilding instance state from topics is either event sourcing (a different product; **Theoretical**) or an accident. Consumers lag, compaction is easy to get wrong, and "where is order 1001?" becomes a consumer-group assignment question. Postgres rows answer it with `SELECT`.
+**Refused.** Kafka is transport. Workflow history for replay is an append-only history owned by the engine, not a rebuild of instance state from task topics. Consumers lag, compaction is easy to get wrong, and "where is order 1001?" must not depend on a consumer-group assignment. Until the history phase, Postgres rows answer it with `SELECT`.
 
 ### 3. Shared database across future business services
 
@@ -165,7 +169,7 @@ Cost of the naive start: weeks of compose, topic naming, consumer-group debuggin
 
 ### 5. Deterministic replay before a working state machine
 
-**Refused in v1.** Replay is how Temporal makes *workflow code* durable. It is not how you learn whether your status enum is wrong. We store current state. Replay stays **Theoretical**.
+**Refused inside the current-state phases.** Replay is how the Temporal clone makes workflow code durable, and it is the product destination. The rows through Phase 7 store current state. A history service and a replay loop land in their own phase, after this document describes that phase. Do not bolt a history log onto `WorkflowExecutor` in a drive-by change.
 
 ### 6. Business logic inside the engine
 
@@ -246,8 +250,7 @@ Later options, only if justified:
 - Horizontal engine instances with `SELECT FOR UPDATE SKIP LOCKED` or a leader + lease (**Planned** Phase 9).
 - Signals, timer steps, branching (**Planned** Phase 10).
 - Observability stack and a workflow UI (**Planned** Phase 11).
-- Deterministic replay (**Theoretical**).
-- Query handlers (**Theoretical**).
+- Deterministic replay and query handlers (**product destination**, not in the current code).
 
 ### Phase 1 architecture (the only slice we implement next)
 
@@ -284,7 +287,7 @@ What this diagram deliberately omits: Kafka, gRPC, five workers, Redis, Elastics
 
 ### Distributed-systems concepts in play in Phase 1
 
-We will teach these with running code, not slides:
+These invariants are already in the running code:
 
 - **Orchestration vs choreography.** One process decides what runs next. Services do not subscribe to each other's domain events yet.
 - **Source of truth.** Engine metadata is strongly consistent in Postgres. The *business* saga will be eventually consistent once workers exist. Those are different guarantees; do not mix them.
@@ -496,7 +499,7 @@ Parent coordinates:
 | When | Module | Why then, not now |
 |---|---|---|
 | Phase 5 | `worker` (singular) | First out-of-process process. One JVM handles all five activity types. Depends on `engine-api` only. |
-| Phase 8 | `worker-order`, … only if the split teaches an ownership boundary | Not before. |
+| Phase 8 | `worker-order`, … only when a service owns its data | Not before. |
 | Phase 5+ | `docker-compose.yml` gains Kafka + worker | Not before the executor is ready to become async. |
 | Phase 11 | optional `console` UI | After the API is stable. |
 
@@ -1143,7 +1146,7 @@ A forward step that fails after earlier steps completed does not leave the insta
 
 ### Phase 8 — Split workers (**Planned**, optional)
 
-Only if we need to teach service-owned data. Same Kafka protocol. Engine unchanged. Skip if theatre.
+Only when a worker must own its own service data. Same Kafka protocol. Engine unchanged. Skip a split that adds processes without an ownership boundary.
 
 ### Phase 9 — Horizontal engine scaling (**Planned**)
 
@@ -1169,16 +1172,21 @@ Structured logs exist from Phase 1 (`workflowId`, `type`, `step`, `attempt`, `st
 
 Only if Kafka request/response is insufficient. Do not build it speculatively.
 
-### **Theoretical** (discussed, not committed)
+### Product destination (committed aim, not in the current code)
 
-- Deterministic replay and Temporal-compatible history
+The finished system is a production-ready Temporal clone:
+
+- Deterministic replay and an append-only workflow history
+- Task-queue matching
 - Query handlers
-- Multi-language SDKs
-- Namespaces / multi-tenancy
+- Multi-language worker SDKs
 - Child workflows, continue-as-new, update-with-start
+- Namespaces / multi-tenancy once a single tenant is production-ready
+
+### Still not the clone
+
 - Visual designer, BPMN
 - Kubernetes operator
-- Using this engine as a product others should adopt instead of Temporal
 
 ---
 
@@ -1195,7 +1203,7 @@ Only if Kafka request/response is insufficient. Do not build it speculatively.
 | Query "where is it?" | Query handler over replayed state | `SELECT` |
 | Fits Phase 1? | No | Yes |
 
-**Choice:** current-state. Replay remains **Theoretical**.
+**Choice for Phases 1–7:** current-state rows are the source of truth. **Choice for the product:** Temporal-style replay is the committed destination and replaces that model when the history phase ships.
 
 ### 2. Choreography (no engine) vs orchestration
 
@@ -1205,7 +1213,7 @@ Choreography fails the product intent: no single place to ask "where is order 10
 
 ### 3. Use Temporal / Cadence / Conductor instead of building one
 
-If the user's real goal were **production workflows next quarter**, the right answer is Temporal (or Conductor). This project's actual goal is to **learn and build** a production-shaped orchestrator. We will not market Phase 1 as a Temporal replacement.
+This repository is the production system. The aim is a production-ready Temporal clone, not a recommendation to adopt Temporal instead, and not a learning project. Phase 7 is the current-state core. It is not yet that clone. The remaining product work is the history service, deterministic replay, task matching, timers, signals, queries, and worker SDKs.
 
 ### 4. One deployable vs many microservices on day 1
 
@@ -1233,7 +1241,7 @@ This is the Phase 1 fork that actually affects correctness.
 | Kafka required? | No | No |
 | Complexity | Slightly less threading | One `TaskExecutor` + poll in tests |
 
-**Choice:** admit-then-run. Sync-to-terminal is how you lose the only handle in the crash scenario the document exists to teach. We will not add `?wait=true` in Phase 1; it would become the path everyone tests.
+**Choice:** admit-then-run. Sync-to-terminal drops the only handle when the process dies during `POST`. Phase 1 has no `?wait=true`. That flag would make clients treat `POST` as the terminal response.
 
 ---
 
@@ -1291,7 +1299,7 @@ Logging of stub `output_json` at DEBUG only.
 
 ## Rollout Plan
 
-There is no production fleet. Rollout is the phase plan.
+There is no production fleet yet. Rollout of the current core is the phase plan. Production readiness is the Temporal-clone destination, not Phase 7.
 
 ### Phase 1 "rollout"
 
@@ -1372,14 +1380,14 @@ curl -s http://localhost:8080/api/v1/workflows/<id>
 
 | Risk | Severity | Mitigation |
 |---|---|---|
-| Scope creep toward Temporal replay, designer, or five services in PR-01 | High | This document; Phase 1 acceptance list; refuse empty modules |
+| Adding history or replay inside a current-state phase, before that phase is specified | High | This document; history and replay get their own phase |
 | One `@Transactional` around start+run silently ships | High | Units-of-work table; PR-03 second-connection test |
 | Stubs accrete real commerce rules and engine-owned `orders` tables | High | Package name `activity.stub`; no business schema; review bar |
 | Phase 2 auto-resume double-charges once stubs become real | High | Phase 2 tests prove double-invoke; Phase 6 is the fix; PR-09 is a hard dep of side-effect PRs |
 | `@Version` plus manual increment | Medium | Forbidden; tests lock `version==10` |
 | Persist-then-publish in Phase 5 loses a Kafka message | Medium | `RUNNING` scanner republishes; outbox *replaces* the dashed path |
 | Multi-instance enabled before Phase 5/6/9 | High | Refuse `replicas > 1` until claim/lock + out-of-process activities |
-| Pretending this replaces Temporal for a production date | High | Alternatives §3; Theoretical label on replay |
+| Describing Phase 7 as the finished Temporal clone | High | Status table; product-destination list |
 | `failAt` ships in production workers | Medium | Phase 5 profile rule |
 
 ---
@@ -1402,7 +1410,7 @@ Deferred, **non-blocking** for Phase 1:
 
 ## References
 
-- Temporal architecture (history, matching, workers, determinism) — conceptual prior art, **not** a compatibility target.
+- Temporal architecture (history, matching, workers, determinism) — the product this repository is cloning. Current types are not yet wire-compatible with Temporal.
 - Netflix Conductor — closer operational shape (server-owned state, workers poll).
 - AWS Step Functions + ASL — managed current-state machines.
 - Garcia-Molina & Salem, *Sagas* (1987) — compensation vs 2PC; Phase 7 prior art.

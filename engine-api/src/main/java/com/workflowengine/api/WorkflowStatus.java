@@ -3,7 +3,9 @@ package com.workflowengine.api;
 /**
  * Lifecycle of one workflow instance as stored on {@code workflow_instance.status}.
  *
- * <p>This is current-state, not a Temporal history. Do not add {@code CANCELED}
+ * <p>This enum is the current-state status on {@code workflow_instance}. The
+ * product destination is a Temporal-style history, and that history is not
+ * this type. Do not add {@code CANCELED}
  * or {@code TIMED_OUT} until a phase implements that transition. Spelling is
  * {@code CANCELED} (one L) when that value appears. Phase 7 adds
  * {@code COMPENSATING} and {@code COMPENSATED} for a linear reverse walk.

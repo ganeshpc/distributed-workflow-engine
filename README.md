@@ -1,8 +1,8 @@
 # Distributed Workflow Engine
 
-A Java 21 / Spring Boot 4.1 workflow **orchestrator**. It coordinates a linear e-commerce **ORDER** saga (create order → reserve inventory → process payment → create shipment → send notification) and stores current state in PostgreSQL.
+A Java 21 / Spring Boot 4.1 workflow engine. The product aim is a **production-ready Temporal clone**: event-sourced history, deterministic replay of workflow code, task-queue matching, durable timers, signals, query handlers, and worker SDKs.
 
-This is **not** Temporal. There is no event-sourced history, no deterministic replay of workflow code, and no task-queue matching. The engine stores *where the saga is now* (`PENDING` / `RUNNING` / `COMPLETED` / `FAILED`) and commits each transition before it calls the next activity.
+The code through Phase 7 is the current-state core of that system. It coordinates a linear e-commerce **ORDER** saga (create order → reserve inventory → process payment → create shipment → send notification) and stores *where the saga is now* in PostgreSQL. Each transition commits before the next activity. History and replay are not in this revision.
 
 **Current stage: Phase 7.** The engine and one worker process, plus Postgres, a separate worker Postgres, and Kafka. The worker runs each canned stub once per attempt. A forward failure after completed steps walks those steps backward and ends `COMPENSATED`. A failure with nothing to undo stays `FAILED`. The stubs are still canned JSON.
 
@@ -451,7 +451,7 @@ A null `deadline_at` never times out. Rows that were already `RUNNING` when `V3`
 
 ## Current code vs the end goal
 
-The **end goal** is still this product: a **durable current-state orchestrator** (Conductor / Step Functions / saga shape), not a Temporal clone. History replay, deterministic workflow-as-code, query handlers, and multi-language SDKs stay **theoretical**. What grows is *where* work runs, *how* it is dispatched, and *how* crashes and failures are handled.
+The **end goal** is a production-ready Temporal clone: history, deterministic replay, task-queue matching, and worker SDKs. Phases 1–7 are the current-state core that system is built on. What grows next, before that runtime, is *where* work runs, *how* it is dispatched, and *how* crashes and failures are handled.
 
 Postgres remains the source of truth for orchestration metadata. Kafka, when it appears, is **transport only**.
 
@@ -498,7 +498,7 @@ Postgres remains the source of truth for orchestration metadata. Kafka, when it 
 
 | Now | End goal |
 |---|---|
-| `POST` / `GET` one workflow. No list, cancel, signal, `?wait=`. | Same admit-then-run. Later: signals `POST /workflows/{id}/signals/{name}`, maybe list/cancel. Still no Temporal query handlers. |
+| `POST` / `GET` one workflow. No list, cancel, signal, `?wait=`. | Same admit-then-run until the history phase. Later current-state signals are `POST /workflows/{id}/signals/{name}`. Query handlers arrive with replay. `GET` of stored state is not a query handler. |
 | Linear `ORDER` in Java (`OrderWorkflowDefinition`). | Still Java definitions unless a later phase chooses otherwise. Branching, parallel+join, timer steps (Phase 10). Not BPMN, not a designer. |
 | Activity records in `engine-api`. Spring Kafka serializes them as JSON on the topics. | Workers depend on `engine-api`, not on `engine`. |
 

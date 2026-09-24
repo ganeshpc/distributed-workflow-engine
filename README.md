@@ -1,8 +1,8 @@
 # Distributed Workflow Engine
 
-A Java 21 / Spring Boot 4.1 workflow **orchestrator**. It coordinates a linear e-commerce **ORDER** saga (create order → reserve inventory → process payment → create shipment → send notification) and stores current state in PostgreSQL.
+A Java 21 / Spring Boot 4.1 workflow engine. The product aim is a **production-ready Temporal clone**: event-sourced history, deterministic replay of workflow code, task-queue matching, durable timers, signals, query handlers, and worker SDKs.
 
-This is **not** Temporal. There is no event-sourced history, no deterministic replay of workflow code, and no task-queue matching. The engine stores *where the saga is now* (`PENDING` / `RUNNING` / `COMPLETED` / `FAILED`) and commits each transition before it calls the next activity.
+The code through Phase 7 is the current-state core of that system. It coordinates a linear e-commerce **ORDER** saga (create order → reserve inventory → process payment → create shipment → send notification) and stores *where the saga is now* in PostgreSQL. Each transition commits before the next activity. History and replay are not in this revision.
 
 **Current stage: Phase 7.** The engine and one worker process, plus Postgres, a separate worker Postgres, and Kafka. The worker runs each canned stub once per attempt. A forward failure after completed steps walks those steps backward and ends `COMPENSATED`. A failure with nothing to undo stays `FAILED`. The stubs are still canned JSON.
 
@@ -453,9 +453,9 @@ A null `deadline_at` never times out. Rows that were already `RUNNING` when `V3`
 
 ## Current code vs the end goal
 
-The **end goal** is still this product: a **durable current-state orchestrator** (Conductor / Step Functions / saga shape), not a Temporal clone. History replay, deterministic workflow-as-code, query handlers, and multi-language SDKs stay **theoretical**. What grows is *where* work runs, *how* it is dispatched, and *how* crashes and failures are handled.
+The **end goal** is a production-ready Temporal clone: history, deterministic replay, task-queue matching, and worker SDKs. Phases 1–7 are the current-state core. The clone roadmap starts at Phase 13 (history log), then workflow tasks, matching, a Java workflow SDK, and history-backed timers, signals, and queries. Phases 8 and 9 are optional current-state work and are not that path.
 
-Postgres remains the source of truth for orchestration metadata. Kafka, when it appears, is **transport only**.
+Postgres is the source of truth for the current rows. From Phase 13 the source of truth for replay is the history, and those rows are a projection. Kafka carries tasks until matching (Phase 15) replaces that dispatch model.
 
 ### Topology
 
@@ -464,7 +464,7 @@ Postgres remains the source of truth for orchestration metadata. Kafka, when it 
 | Processes | Engine JVM + one worker JVM | Optional split into service-owned workers (Phase 8). |
 | Compose | Postgres + Kafka | No five microservices. |
 | Who runs activities | Worker process implements `Activity` from `engine-api` and skips a stored attempt | Stubs still return canned JSON. No card network or stock database. |
-| Engine replicas | `replicas > 1` is a defect | Allowed only after out-of-process activities (5), idempotent activities (6), and `SKIP LOCKED` claim (9). |
+| Engine replicas | `replicas > 1` is a defect | Current-state claim is optional Phase 9. The clone's scale is shard ownership (Phase 21). |
 
 ### How a step runs
 
@@ -483,15 +483,15 @@ Postgres remains the source of truth for orchestration metadata. Kafka, when it 
 
 | Now | End goal |
 |---|---|
-| Scanner submits the executor, which republishes a due `RUNNING` task at the same attempt. Lost messages are recovered from the committed row. | Phase 9: multi-instance engines claim rows with `SKIP LOCKED` before publishing. |
-| Inflight set is in-memory (one process) | Multi-instance engines claim rows with `SELECT … FOR UPDATE SKIP LOCKED` (Phase 9). `@Version` rejects stale writers. |
+| Scanner submits the executor, which republishes a due `RUNNING` task at the same attempt. Lost messages are recovered from the committed row. | From Phase 13 a lost task is recovered by reading history. Shard owners (Phase 21) append that history. |
+| Inflight set is in-memory (one process) | Optional Phase 9 claims current-state rows. The clone uses one shard owner per execution history (Phase 21). |
 | `FAILED` is never retried, including error `TIMED_OUT` | Retry policy on `FAILED` can be turned on once backoff/`next_attempt_at` are used for that path. A distinct `TIMED_OUT` status waits until a phase branches on it. |
 
 ### Time, failure, and side effects
 
 | Concern | Now | End goal |
 |---|---|---|
-| Time | Per-attempt `deadline_at` (ORDER: 5 minutes). Poller fails a due `RUNNING` step with `TIMED_OUT`. Backoff field exists; ORDER uses zero delay. | Phase 10: first-class timer *steps*. The poller is not that. |
+| Time | Per-attempt `deadline_at` (ORDER: 5 minutes). Poller fails a due `RUNNING` step with `TIMED_OUT`. Backoff field exists; ORDER uses zero delay. | Phase 17: timers are history events. The poller is not that. |
 | Activity failure | Stub `failAt` or `success=false` → step-fail; instance `FAILED`; later steps stay `PENDING`. | Same forward fail, then **compensation** (Phase 7): reverse walk of completed steps, states `COMPENSATING` / `COMPENSATED`. Requires Phase 6. |
 | Double invoke after crash | A delivery that arrives before the worker commits the attempt can run the stub again. After that row exists, the same attempt is not executed again. Stubs still have no money/stock. | Real payment and inventory calls use this store. A crash during execute, before the row commits, can still run twice. |
 | `failAt` | Worker honors it only when `spring.profiles.active=test`. | Unchanged. |
@@ -500,8 +500,8 @@ Postgres remains the source of truth for orchestration metadata. Kafka, when it 
 
 | Now | End goal |
 |---|---|
-| `POST` / `GET` one workflow. No list, cancel, signal, `?wait=`. | Same admit-then-run. Later: signals `POST /workflows/{id}/signals/{name}`, maybe list/cancel. Still no Temporal query handlers. |
-| Linear `ORDER` in Java (`OrderWorkflowDefinition`). | Still Java definitions unless a later phase chooses otherwise. Branching, parallel+join, timer steps (Phase 10). Not BPMN, not a designer. |
+| `POST` / `GET` one workflow. No list, cancel, signal, `?wait=`. | Signals and queries are Phase 17, recorded in history. `GET` of the projection is not a query handler. List and search are Phase 20. |
+| Linear `ORDER` in Java (`OrderWorkflowDefinition`). | Phase 16 moves ORDER into a deterministic workflow function. Branching is that code, not a step-row interpreter. Not BPMN, not a designer. |
 | Activity records in `engine-api`. Spring Kafka serializes them as JSON on the topics. | Workers depend on `engine-api`, not on `engine`. |
 
 ### Data that stays vs data that appears later
@@ -510,7 +510,7 @@ Postgres remains the source of truth for orchestration metadata. Kafka, when it 
 
 **Already added:** `next_attempt_at`, `deadline_at`, `RetryPolicy` and `timeout` on `StepDefinition`.
 
-**Planned tables/states, not present now:** `workflow_event` (audit/UI), outbox (if persist-then-publish drops publishes), `COMPENSATING` / `COMPENSATED` / `CANCELED` / a distinct `TIMED_OUT` status, worker-side idempotency keys.
+**Planned with the clone:** append-only history in Phase 13, which is the first reader of that log. Visibility index in Phase 20. Outbox only by replacing the direct publish path. `CANCELED` and a distinct `TIMED_OUT` status wait until a phase branches on them.
 
 ### Picture
 

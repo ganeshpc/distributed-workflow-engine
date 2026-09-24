@@ -20,15 +20,17 @@ Also forbidden: deleting `main`, force-pushing `main` or the PR branch after rev
 
 The design contract is `docs/architecture.md`. If code and that document disagree, stop and update the document first. Do not silently change Phase 1 invariants, the REST contract, the schema, or the transaction model.
 
-This is a **durable current-state orchestrator** (Conductor / Step Functions / saga orchestrator shape). It is **not** a Temporal clone. Do not introduce history replay, deterministic workflow-as-code, task-queue matching, query handlers, or Temporal type/protocol names.
+The product aim is a **production-ready Temporal clone**: event-sourced history, deterministic replay of workflow code, task-queue matching, durable timers, signals, query handlers, and worker SDKs. This repository is that product. It is not a learning exercise and not a side project.
+
+The code through Phase 7 is the current-state core (Conductor / Step Functions / saga shape). Postgres is the source of truth for that core. Do not add history replay, deterministic workflow-as-code, task-queue matching, query handlers, or Temporal wire types until the phase that builds them, and update `docs/architecture.md` in that change. Do not describe Phase 7 as the finished clone.
 
 Honesty labels used in `docs/architecture.md`:
 
 - **Phase 1** — implemented. Single Spring Boot process + PostgreSQL. Linear `ORDER` saga. In-process stub activities. REST start/query. No auto-resume.
 - **Planned** — later increment. Do not start unless the user asked for that phase.
-- **Theoretical** — vocabulary only. Not committed.
+- **Theoretical** — discussed, and not part of the Temporal-clone destination unless a later revision promotes it.
 
-Current code is Phase 7 (PR-10): the engine commits `RUNNING`, publishes `activity.tasks`, and applies `activity.results`. One `worker` module runs the forward stubs and their compensation stubs, and stores a finished attempt in its own database. A redelivery of the same `(workflowId, step, attempt)` publishes the stored result and does not execute again. A forward failure after completed steps walks those steps backward and ends `COMPENSATED`. A failure with nothing to undo stays `FAILED`. `FAILED` and `COMPENSATED` are not retried. Next planned increment is Phase 8 (optional worker split) when that phase is requested. Do not scaffold signals, timer steps, a second worker, or a designer "for later".
+Current code is Phase 7 (PR-10): the engine commits `RUNNING`, publishes `activity.tasks`, and applies `activity.results`. One `worker` module runs the forward stubs and their compensation stubs, and stores a finished attempt in its own database. A redelivery of the same `(workflowId, step, attempt)` publishes the stored result and does not execute again. A forward failure after completed steps walks those steps backward and ends `COMPENSATED`. A failure with nothing to undo stays `FAILED`. `FAILED` and `COMPENSATED` are not retried. The clone path starts at Phase 13 (history log) when that phase is requested. Phases 8 and 9 are optional current-state work and are not that path. Phases 10 and 12 are withdrawn. Do not scaffold signals, timer steps, a second worker, a history table, or a designer until the phase that owns them.
 
 ---
 
@@ -203,7 +205,7 @@ Error bodies are generic (`Bad Request`, `Not Found`, `Payload Too Large`, `Serv
 - Flyway SQL under `engine/src/main/resources/db/migration/`. `spring.jpa.hibernate.ddl-auto=none`.
 - JSON payloads are `JSONB`. Timestamps are `TIMESTAMPTZ`, assigned by PostgreSQL. Map with Hibernate `@Generated` / `insertable=false, updatable=false`. Tests must not assert equality with `Instant.now()` from the JVM.
 - Step order is `workflow_step.position`. Names are not an order. Do not `ORDER BY started_at`.
-- Do not add `workflow_event` until a phase that reads it.
+- Do not add `workflow_event` before Phase 13. That phase is the first reader.
 - Do not add `CANCELED` / `TIMED_OUT` / `COMPENSATING` status values or check constraints until a phase branches on that status. Phase 3 records timeouts as `FAILED` with error `TIMED_OUT` and column `deadline_at`.
 - Schema PRs after Phase 1 are expand/contract if rows exist that matter.
 
@@ -444,17 +446,17 @@ Refuse even if it photographs well. Changing these requires an architecture-doc 
 - Kafka (or anything else) as source of truth for workflow state
 - Shared business tables in the engine database
 - XA / 2PC
-- Deterministic replay, history service, Temporal SDK types
+- History replay, a history service, task-queue matching, query handlers, or Temporal SDK types inside a current-state phase. Those are the product destination and land in their own phase.
 - Business rules inside the engine or stubs that stop being stubs
 - Visual designer, BPMN, custom DSL parser
 - Kubernetes operators, service mesh
 - Spring Statemachine as the durability story
 - One `@Transactional` around admission + all invokes
 - Starting the executor on idempotent `200` (scanner resumes leftovers; POST `200` must not submit)
-- `replicas > 1` until Phase 5 (out-of-process activities), Phase 6 (idempotent activities), and Phase 9 (claim/lock)
+- `replicas > 1` on the current-state engine until Phase 5, Phase 6, and optional Phase 9. Clone scale is Phase 21 shard ownership, not Phase 9.
 - Optional idempotency keys before a list or lookup-by-key API exists
 - Output chaining between steps
-- Query handlers (Temporal meaning)
+- Query handlers inside the current-state API. `GET` of stored state is the Phase 7 query. History query handlers arrive with replay.
 
 ---
 

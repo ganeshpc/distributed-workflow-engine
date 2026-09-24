@@ -1,6 +1,8 @@
-# Engine
+# Engine code flow
 
 The `engine` module is the Spring Boot process that admits an ORDER workflow and moves it forward one committed Postgres transaction at a time. This page follows a start request through the classes that handle it.
+
+Keep this file in the same change as the code it draws. When a class in the table below changes its thread, transaction, status write, publish, or the next class it calls, update the matching diagram and the table row. That includes the worker classes drawn on the result path (`TaskListener`, `ActivityIdempotencyStore`, `WorkerActivityInvoker`). `AGENTS.md` requires the update. A diagram that no longer matches the code is a bug.
 
 A client posts to `POST /api/v1/workflows`. The request thread commits the instance as `PENDING` and returns. A `workflow-*` thread then starts one step and publishes `ActivityContext` on `activity.tasks`. The worker runs the activity. The engine applies `ActivityCompletion` from `activity.results` and either starts the next step, compensates, or stops.
 

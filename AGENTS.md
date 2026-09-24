@@ -82,6 +82,8 @@ A worker module depends on `engine-api`, never on `engine`.
 
 `WorkflowExecutor` must not import `com.workflowengine.worker`. It publishes a task and applies a result. There is a bytecode test that it does not name the stub package; keep it green.
 
+`engine/code-flow.md` draws this path from `POST /api/v1/workflows`. Update that file in the same change as the classes it names. See Changing the system.
+
 Do not create empty `worker*` modules. Modules appear in the PR that first has a class a JVM will load.
 
 ---
@@ -461,8 +463,9 @@ Refuse even if it photographs well. Changing these requires an architecture-doc 
 1. Read `docs/architecture.md` for the phase you are in. Phase 1 forks in Key Decisions are decided.
 2. If you need a new state, column, endpoint, or module, check the roadmap (Phase 2 recovery, Phase 3 timeout poller, Phase 5 Kafka + one worker, …) and implement that phase — do not invent a parallel design.
 3. Update `docs/architecture.md` in the same change when behavior, schema, or API contracts change.
-4. Keep README curl path accurate when the local run story changes.
-5. Javadoc and tests land with the code.
+4. Update `engine/code-flow.md` in the same change when engine code on that path changes. The file is the class flow from `POST /api/v1/workflows` through admission, dispatch, `WorkflowExecutor`, task publish, result apply, compensation, recovery, and timeout. If a drawn class changes its thread, transaction, status write, publish, or the next class it calls, change the diagram and the class table in that same commit. Include the worker classes the result diagram names (`TaskListener`, `ActivityIdempotencyStore`, `WorkerActivityInvoker`) when their part of the path changes. A diagram that disagrees with the code is a bug. Do not leave the update for a later docs PR.
+5. Keep README curl path accurate when the local run story changes.
+6. Javadoc and tests land with the code.
 
 ### Git and pull requests
 

@@ -12,6 +12,9 @@ import com.workflowengine.api.WorkflowStatus;
 import com.workflowengine.application.AdmissionResult;
 import com.workflowengine.application.InvalidStartWorkflowException;
 import com.workflowengine.application.StartWorkflowService;
+import com.workflowengine.history.HistoryEventType;
+import com.workflowengine.history.WorkflowEventEntity;
+import com.workflowengine.history.WorkflowHistory;
 import com.workflowengine.persistence.WorkflowInstanceEntity;
 import com.workflowengine.persistence.WorkflowInstanceRepository;
 import com.workflowengine.persistence.WorkflowStepEntity;
@@ -102,6 +105,9 @@ class WorkflowExecutionTest {
     @Autowired
     private WorkflowInstanceRepository instances;
 
+    @Autowired
+    private WorkflowHistory history;
+
     @BeforeEach
     void resetStubs() {
         ActivityBlockHook.clear();
@@ -155,6 +161,17 @@ class WorkflowExecutionTest {
         WorkflowStepEntity last = done.getSteps().get(4);
         assertThat(done.getOutputJson()).isEqualTo(last.getOutputJson());
         assertThat(done.getOutputJson()).contains("SEND_NOTIFICATION");
+        assertThat(history.read(done.getId()))
+                .extracting(WorkflowEventEntity::getEventType)
+                .containsExactly(
+                        HistoryEventType.WORKFLOW_ADMITTED,
+                        HistoryEventType.STEP_STARTED, HistoryEventType.STEP_COMPLETED,
+                        HistoryEventType.STEP_STARTED, HistoryEventType.STEP_COMPLETED,
+                        HistoryEventType.STEP_STARTED, HistoryEventType.STEP_COMPLETED,
+                        HistoryEventType.STEP_STARTED, HistoryEventType.STEP_COMPLETED,
+                        HistoryEventType.STEP_STARTED, HistoryEventType.STEP_COMPLETED,
+                        HistoryEventType.WORKFLOW_COMPLETED);
+        assertMonotonicHistory(done.getId(), WorkflowStatus.COMPLETED);
     }
 
     @Test
@@ -190,6 +207,19 @@ class WorkflowExecutionTest {
         assertThat(steps.get(6).getName()).isEqualTo("COMPENSATE_CREATE_ORDER");
         assertThat(steps.get(6).getStatus()).isEqualTo(StepStatus.COMPLETED);
         assertThat(steps.get(6).getAttempt()).isEqualTo(1);
+        assertThat(history.read(done.getId()))
+                .extracting(WorkflowEventEntity::getEventType)
+                .containsExactly(
+                        HistoryEventType.WORKFLOW_ADMITTED,
+                        HistoryEventType.STEP_STARTED, HistoryEventType.STEP_COMPLETED,
+                        HistoryEventType.STEP_STARTED, HistoryEventType.STEP_COMPLETED,
+                        HistoryEventType.STEP_STARTED, HistoryEventType.STEP_FAILED,
+                        HistoryEventType.COMPENSATION_PLANNED, HistoryEventType.COMPENSATION_PLANNED,
+                        HistoryEventType.WORKFLOW_COMPENSATING,
+                        HistoryEventType.STEP_STARTED, HistoryEventType.STEP_COMPLETED,
+                        HistoryEventType.FORWARD_COMPENSATED,
+                        HistoryEventType.STEP_STARTED, HistoryEventType.STEP_COMPLETED,
+                        HistoryEventType.FORWARD_COMPENSATED, HistoryEventType.WORKFLOW_COMPENSATED);
     }
 
     @Test
@@ -216,6 +246,13 @@ class WorkflowExecutionTest {
                     assertThat(step.getStartedAt()).isNull();
                     assertThat(step.getAttempt()).isZero();
                 });
+        assertThat(history.read(done.getId()))
+                .extracting(WorkflowEventEntity::getEventType)
+                .containsExactly(
+                        HistoryEventType.WORKFLOW_ADMITTED,
+                        HistoryEventType.STEP_STARTED,
+                        HistoryEventType.STEP_FAILED,
+                        HistoryEventType.WORKFLOW_FAILED);
     }
 
     @Test
@@ -305,6 +342,16 @@ class WorkflowExecutionTest {
         assertThat(snapshot.steps())
                 .extracting(StepSnapshot::attempt)
                 .containsOnly(0);
+    }
+
+    private void assertMonotonicHistory(UUID workflowId, WorkflowStatus terminal) {
+        List<WorkflowEventEntity> events = history.read(workflowId);
+        assertThat(events).isNotEmpty();
+        for (int i = 0; i < events.size(); i++) {
+            assertThat(events.get(i).getEventId()).isEqualTo(i + 1L);
+            assertThat(events.get(i).getWorkflowInstanceId()).isEqualTo(workflowId);
+        }
+        assertThat(events.get(events.size() - 1).getInstanceStatus()).isEqualTo(terminal);
     }
 
     private static StartWorkflowCommand command(String idempotencyKey, String inputJson) {

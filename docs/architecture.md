@@ -4,9 +4,9 @@
 |---|---|
 | **Author** | Engineering |
 | **Date** | 2026-09-13 |
-| **Status** | Draft. Phases 1–3 and 5–7 are implemented. Phase 4 was skipped. The product aim is a production-ready Temporal clone. The current code is the current-state core. The clone roadmap starts at Phase 13 (history log). Phases 8 and 9 are optional current-state work and are not that path. Phases 10 and 12 are withdrawn. Where an early section still says Phase 1 is the next slice, [Incremental Roadmap](#incremental-roadmap) is the status to follow. |
+| **Status** | Draft. Phases 1–3, 5–7, and 13 are implemented. Phase 4 was skipped. The product aim is a production-ready Temporal clone. Phase 13 is the history log. The next clone phase is Phase 14. Phases 8 and 9 are optional current-state work and are not that path. Phases 10 and 12 are withdrawn. Where an early section still says Phase 1 is the next slice, [Incremental Roadmap](#incremental-roadmap) is the status to follow. |
 | **Type** | Architecture + incremental implementation plan |
-| **Code in this revision** | Phases 1–3 and 5–7. History, deterministic replay, task-queue matching, and worker SDKs are the committed destination and are not in this revision. |
+| **Code in this revision** | Phases 1–3, 5–7, and 13. The history log is written. Deterministic replay, task-queue matching, and worker SDKs are not in this revision. |
 
 Honesty labels used throughout:
 
@@ -1192,13 +1192,13 @@ Structured logs exist from Phase 1 (`workflowId`, `type`, `step`, `attempt`, `st
 
 gRPC-if-Kafka-is-slow is not a phase. Workflow tasks and activity tasks, task queues, and task tokens are Phase 15. The matching API is chosen there. Do not add a second worker protocol beside `activity.tasks` before that phase.
 
-### Phase 13 — History log (**Planned**, first clone phase)
+### Phase 13 — History log (**implemented**)
 
-Append-only events for one execution, written in one transaction. Event identity is the workflow execution plus a monotonic event id. Current `workflow_instance` and `workflow_step` rows are updated from those events in the same transaction, and `GET` keeps reading the projection.
+Append-only events for one execution, written in one transaction. Event identity is the workflow execution plus a monotonic `event_id` starting at 1. `workflow_event` is that log. `GET` still reads `workflow_instance` and `workflow_step`, which are the projection updated in the same transaction.
 
-- A crash recovers by reading the history, then the projection.
-- Nothing replays workflow code in this phase. The current executor may append the events for the transitions it already commits, so the log has a writer and a test before command matching exists.
-- Do not add a `workflow_event` table that nothing reads. This phase is the reader.
+- Admission appends `WORKFLOW_ADMITTED`. Each later committed transition appends its own event: step start, step complete, workflow complete, step fail, compensation planned, instance `COMPENSATING` or `FAILED`, forward step `COMPENSATED`, and instance `COMPENSATED`.
+- `RecoveryScanner` reads that history, then decides from the projection. An empty history is logged and the projection is still used, so a row written before this table existed can resume.
+- Nothing replays workflow code in this phase. A republish that does not change a row appends nothing.
 
 ### Phase 14 — Workflow tasks (**Planned**)
 
@@ -1622,7 +1622,7 @@ Signals, timer steps, and branching on current-state rows are not this PR. That 
 
 gRPC-if-Kafka-is-slow is not this PR. Task queues and task tokens are PR-18.
 
-### PR-16 — History log (**Phase 13**)
+### PR-16 — History log (**Phase 13**, **implemented**)
 
 - **Title:** Append-only execution history and a projection
 - **Files/components:** history table; writer in the existing transition transactions; reader test; projection still served by `GET`

@@ -4,6 +4,8 @@ import com.workflowengine.api.StartWorkflowCommand;
 import com.workflowengine.api.StepStatus;
 import com.workflowengine.api.WorkflowStatus;
 import com.workflowengine.domain.StepDefinition;
+import com.workflowengine.history.HistoryEventType;
+import com.workflowengine.history.WorkflowHistory;
 import com.workflowengine.domain.WorkflowDefinition;
 import com.workflowengine.domain.WorkflowDefinitionRegistry;
 import com.workflowengine.persistence.WorkflowInstanceEntity;
@@ -51,6 +53,7 @@ public class StartWorkflowService {
     private final WorkflowInstanceRepository instances;
     private final WorkflowDefinitionRegistry definitions;
     private final WorkflowDispatcher dispatcher;
+    private final WorkflowHistory history;
     private final TransactionTemplate transactionTemplate;
 
     /**
@@ -60,17 +63,20 @@ public class StartWorkflowService {
      * @param instances instance repository
      * @param definitions type registry
      * @param dispatcher submit-once runner after the admit transaction
+     * @param history appends {@code WORKFLOW_ADMITTED} in the admit transaction
      * @param transactionManager used only for admit insert
      */
     public StartWorkflowService(
             WorkflowInstanceRepository instances,
             WorkflowDefinitionRegistry definitions,
             WorkflowDispatcher dispatcher,
+            WorkflowHistory history,
             PlatformTransactionManager transactionManager
     ) {
         this.instances = instances;
         this.definitions = definitions;
         this.dispatcher = dispatcher;
+        this.history = history;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
 
@@ -160,7 +166,9 @@ public class StartWorkflowService {
             step.setAttempt(0);
             instance.addStep(step);
         }
-        return instances.saveAndFlush(instance);
+        WorkflowInstanceEntity saved = instances.saveAndFlush(instance);
+        history.append(saved, HistoryEventType.WORKFLOW_ADMITTED, null);
+        return saved;
     }
 
     /**
